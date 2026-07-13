@@ -1,0 +1,11 @@
+{
+  "pasteId": "12345678-90AB-CDEF-1234-567890ABCDEF",
+  "uuids": [
+    "AAAAAAAA-0000-0000-0000-000000000001",
+    "BBBBBBBB-0000-0000-0000-000000000002",
+    "CCCCCCCC-0000-0000-0000-000000000003"
+  ],
+  "classes": ["CRLWPStickyNoteItem", "CRLWPShapeItem", "CRLConnectionLineItem"],
+  "manifestRefs": 3,
+  "colors": ["#e54d99", "#54bef0"]
+}

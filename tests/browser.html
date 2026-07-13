@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>libfreeform browser smoke</title>
+<!-- Bare specifier resolves through the same package the other runtimes use;
+     the default ("browser") entry fetches the wasm relative to the module. -->
+<script type="importmap">
+  { "imports": { "libfreeform": "/node_modules/libfreeform/dist/index.js" } }
+</script>
+<body>
+  <pre id="out">running…</pre>
+  <script type="module">
+    const out = document.getElementById('out');
+    const fixture = async name => {
+      const res = await fetch(`/fixtures/${name}`);
+      if (!res.ok) throw new Error(`fixture ${name}: HTTP ${res.status}`);
+      return new Uint8Array(await res.arrayBuffer());
+    };
+    try {
+      const api = await import('libfreeform');
+      const { runChecks } = await import('/checks.mjs');
+      const count = runChecks(api, {
+        inkPen: await fixture('ink-pen.drawing'),
+        nativeMixed: await fixture('native-mixed.crlnative'),
+        tsuDescription: await fixture('native-mixed.tsudescription'),
+        realBoardNative: await fixture('real-board.crlnative'),
+        realBoardTsu: await fixture('real-board.tsudescription'),
+      });
+      out.textContent = window.__result = `PASS ${count} checks (browser)`;
+    } catch (err) {
+      out.textContent = window.__result = `FAIL ${err?.stack ?? err}`;
+    }
+  </script>
+</body>

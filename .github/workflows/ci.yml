@@ -1,0 +1,97 @@
+# Two pillars:
+#   rust — fmt/clippy/tests for the native crate on Linux, macOS, Windows.
+#   wasm — build the npm package, then run the same smoke-test contract on
+#          Node, Bun, Deno, and headless Chromium (Playwright).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Must match the `wasm-bindgen = "=x.y.z"` pin in root Cargo.toml.
+  WASM_BINDGEN_VERSION: 0.2.126
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # rustfmt.toml uses nightly-only options; format checks run on nightly,
+      # everything else on stable (installed last, so it is the default).
+      - uses: dtolnay/rust-toolchain@nightly
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          components: rustfmt
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo +nightly fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-features
+      - name: Package check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo publish --dry-run --locked
+
+  lint-js:
+    name: biome
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: biome@2.5.3
+      - run: biome ci .
+
+  wasm:
+    name: wasm (node, bun, deno, chromium)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - name: Install wasm-opt
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Build npm package
+        run: node npm/build.mjs
+      - name: Install Playwright
+        working-directory: tests
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+      - name: Link package into tests
+        run: node tests/setup.mjs
+      - name: Smoke (Node)
+        run: node tests/smoke.mjs
+      - name: Smoke (Bun)
+        run: bun tests/smoke.mjs
+      - name: Smoke (Deno)
+        run: deno run -R tests/smoke.mjs
+      - name: Smoke (Chromium)
+        run: node tests/browser.mjs

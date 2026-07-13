@@ -1,0 +1,157 @@
+[package]
+name = "libfreeform"
+description = "Parser for Apple Freeform pasteboard data: PencilKit ink, the CRLNativeData object graph, and the TSUDescription manifest"
+keywords = ["freeform", "apple", "pasteboard", "pencilkit", "parser"]
+categories = ["parser-implementations"]
+readme = "README.md"
+documentation = "https://docs.rs/libfreeform"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/can1357/libfreeform"
+include = [
+   "/Cargo.toml",
+   "/README.md",
+   "/LICENSE-APACHE",
+   "/LICENSE-MIT",
+   "/src/**",
+   "/libfreeform-wasm/**",
+   "/fixtures/**",
+]
+
+[lib]
+# Native builds expose the normal Rust library. wasm builds use the same crate
+# as a cdylib; `libfreeform-wasm/lib.rs` is compiled only for that target.
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+## Derive `serde::{Serialize, Deserialize}` (camelCase field names) on all
+## decoded data types.
+serde = ["dep:serde"]
+## Compile wasm-bindgen exports when building this crate for wasm32. This
+## feature is intentionally inert on native targets so `--all-features` stays
+## useful for the rlib test and lint matrix.
+wasm = ["serde", "dep:serde-wasm-bindgen", "dep:wasm-bindgen"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+serde-wasm-bindgen = { version = "0.6", optional = true }
+# Pinned exactly: the wasm-bindgen CLI that post-processes the cdylib must
+# match this version (see npm/build.mjs and .github/workflows).
+wasm-bindgen = { version = "=0.2.126", optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Small, fast wasm: the npm artifact is built from this profile.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.clippy]
+# ──────────────────────────────────────────────────────────────────────────────
+# Base Lint Levels
+# ──────────────────────────────────────────────────────────────────────────────
+all = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Meta: Lint Attributes
+# ──────────────────────────────────────────────────────────────────────────────
+allow_attributes_without_reason = "warn" # Enforce reason for all #[allow]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Safety & Unsafe Code
+# ──────────────────────────────────────────────────────────────────────────────
+undocumented_unsafe_blocks = "warn"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Numeric Casts & Conversions
+# ──────────────────────────────────────────────────────────────────────────────
+cast_lossless = "allow"            # u32 as u64 - 'as' is cleaner than From
+cast_possible_truncation = "allow" # u64 as u32 - often intentional
+cast_possible_wrap = "allow"       # u32 as i32 - can be intentional
+cast_precision_loss = "allow"      # f64 as f32 - sometimes acceptable
+cast_sign_loss = "allow"           # i32 as u32 - sometimes needed
+tuple_array_conversions = "allow"  # Non-Into conversion is more clear
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Floating Point
+# ──────────────────────────────────────────────────────────────────────────────
+float_cmp = "allow"         # Tests mostly do this + we know what we're doing
+suboptimal_flops = "allow"  # mul_add changes rounding; decoders must stay bit-stable
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Functions & Closures
+# ──────────────────────────────────────────────────────────────────────────────
+inline_always = "allow"                      # Needed for performance-critical code
+must_use_candidate = "allow"                 # Not every function needs #[must_use]
+needless_pass_by_value = "allow"
+redundant_closure_for_method_calls = "allow" # .map(ToString::to_string) can be clearer
+return_self_not_must_use = "allow"           # Builder pattern methods
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Structs & Types
+# ──────────────────────────────────────────────────────────────────────────────
+inconsistent_struct_constructor = "allow"
+missing_fields_in_debug = "allow"         # Not every field needs to be in Debug output
+struct_excessive_bools = "allow"          # Usually with builders
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pattern Matching
+# ──────────────────────────────────────────────────────────────────────────────
+match_same_arms = "allow"                    # Can be intentional for clarity
+match_wildcard_for_single_variants = "allow" # _ can be clearer than listing variants
+option_if_let_else = "allow"                 # match/if-let-else often clearer
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Imports & Module Organization
+# ──────────────────────────────────────────────────────────────────────────────
+enum_glob_use = "allow"
+items_after_statements = "allow" # Sometimes more readable
+wildcard_imports = "allow"       # Cleaner for preludes and test modules
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Variables & Type Inference
+# ──────────────────────────────────────────────────────────────────────────────
+let_underscore_untyped = "allow" # Type obvious from context
+similar_names = "allow"          # 'req' and 'res' together are fine
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Literals & Formatting
+# ──────────────────────────────────────────────────────────────────────────────
+unreadable_literal = "allow" # 10_000_000 vs 0xDEADBEEF is context dependent
+verbose_bit_mask = "allow"   # Explicit bit patterns can be clearer than hex
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Code Style
+# ──────────────────────────────────────────────────────────────────────────────
+default_trait_access = "allow"        # Default::default() sometimes clearer
+significant_drop_tightening = "allow" # We pay attention to this already
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Documentation
+# ──────────────────────────────────────────────────────────────────────────────
+missing_errors_doc = "allow" # Documenting every error return is often redundant
+missing_panics_doc = "allow" # Not every panic needs docs, especially assert!
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Complexity
+# ──────────────────────────────────────────────────────────────────────────────
+too_many_lines = "allow" # Arbitrary limits don't account for necessary complexity

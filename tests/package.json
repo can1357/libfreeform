@@ -1,0 +1,12 @@
+{
+  "name": "libfreeform-tests",
+  "private": true,
+  "type": "module",
+  "description": "Cross-runtime smoke tests; `libfreeform` resolves through the symlink created by setup.mjs (declared here so npm install keeps it)",
+  "dependencies": {
+    "libfreeform": "file:../npm"
+  },
+  "devDependencies": {
+    "playwright": "^1.54.0"
+  }
+}

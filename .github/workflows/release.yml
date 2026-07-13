@@ -1,0 +1,92 @@
+# Tag-driven release: push a `v<version>` tag and this publishes the crate to
+# crates.io and the package to npm — both via OIDC trusted publishing, no
+# long-lived registry tokens. One-time registry setup lives in RELEASING.md.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  WASM_BINDGEN_VERSION: 0.2.126
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches crate and npm versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          NPM="$(node -p "require('./npm/package.json').version")"
+          if [ "$TAG" != "$CRATE" ] || [ "$TAG" != "$NPM" ]; then
+            echo "tag v$TAG does not match crate $CRATE / npm $NPM" >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - name: Install wasm-opt
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Test
+        run: cargo test --all-features
+      - name: Build npm package and smoke it
+        run: |
+          node npm/build.mjs
+          node tests/setup.mjs
+          node tests/smoke.mjs
+
+  publish-crate:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC token exchange with crates.io
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  publish-npm:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC trusted publishing with npm (provenance is automatic)
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - name: Install wasm-opt
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+      - name: Ensure npm >= 11.5.1 (OIDC support)
+        run: npm install -g npm@latest
+      - name: Build npm package
+        run: node npm/build.mjs
+      - name: Publish
+        working-directory: npm
+        run: npm publish
