@@ -142,6 +142,7 @@ The `com.apple.freeform.*` formats are private and can change with any Freeform 
 - `tests/` — cross-runtime smoke tests (Node, Bun, Deno, headless Chromium)
 - `docs/FORMAT.md` — the reverse-engineered format documentation
 - `tools/dump_pasteboard.swift` — pasteboard capture utility
+- `tools/release.mjs` — synchronized Cargo/npm version commit and annotated-tag publisher
 
 ### Development
 

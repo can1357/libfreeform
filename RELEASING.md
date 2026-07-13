@@ -4,17 +4,26 @@ Releases are tag-driven: pushing `v<version>` runs `.github/workflows/release.ym
 
 ## Per-release flow
 
-1. Bump the version in **both** places (the release workflow refuses mismatches):
-   - Root `Cargo.toml` → `[package] version`, then run `cargo check` to refresh `Cargo.lock`.
-   - `npm/package.json` → `version`.
-2. Commit, then tag and push:
+From a clean, current branch:
 
-   ```sh
-   git tag v0.1.1
-   git push origin main v0.1.1
-   ```
+```sh
+# Preview the exact version/commit/tag without mutating anything.
+bun tools/release.mjs --dry-run 1.0.0
 
-3. CI runs `verify` (tests + npm build + smoke), then `publish-crate` and `publish-npm` in parallel. npm provenance attestations are generated automatically because the publish goes through trusted publishing.
+# Update Cargo + npm, refresh Cargo.lock, commit, tag, and atomically push.
+bun tools/release.mjs 1.0.0
+```
+
+The script requires synchronized Cargo/npm versions, a new `v<version>` tag,
+an `origin` remote, and no uncommitted changes. It creates
+`chore: bumped to version <version>`, creates an annotated tag, then atomically
+pushes the branch and tag. CI runs `verify` (tests + npm build + smoke), then
+`publish-crate` and `publish-npm` in parallel. npm provenance attestations are
+generated automatically because the publish goes through trusted publishing.
+
+If a process dies after staging only those three version files, inspect the
+diff and use `bun tools/release.mjs --resume <version>`. Resume refuses every
+other staged, unstaged, or untracked file.
 
 ## One-time registry setup
 
