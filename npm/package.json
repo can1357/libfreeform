@@ -1,6 +1,6 @@
 {
   "name": "libfreeform",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Parse Apple Freeform pasteboard data: PencilKit ink, the CRLNativeData object graph, and the TSUDescription manifest. Rust compiled to WebAssembly; works in Node, Bun, Deno, and browsers.",
   "license": "(MIT OR Apache-2.0)",
   "type": "module",
