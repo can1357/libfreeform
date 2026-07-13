@@ -64,4 +64,4 @@ Optional hardening for either registry: create a GitHub **environment** (e.g. `r
 ## Version pins that matter
 
 - **wasm-bindgen**: the crate pin in root `Cargo.toml` (`wasm-bindgen = "=x.y.z"`), the `WASM_BINDGEN_VERSION` env in both workflows, and your locally installed `wasm-bindgen` CLI must all match. `npm/build.mjs` fails loudly when the CLI drifts. To upgrade: bump the crate pin, `cargo update -p wasm-bindgen`, bump both workflow envs, and `cargo install wasm-bindgen-cli --version <new> --locked`.
-- **wasm-opt** (binaryen) is optional at build time — the build warns and ships unoptimized wasm without it — but CI installs it so published artifacts are always optimized.
+- **wasm-opt** (binaryen) is optional at build time. The build uses it only at version 123 or newer; older releases corrupt wasm-bindgen externref tables and fail under Node 24. CI intentionally ships the portable unoptimized artifact unless a vetted optimizer is added.

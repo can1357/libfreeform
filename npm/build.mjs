@@ -25,6 +25,8 @@ const wasmArtifact = join(
   'libfreeform.wasm',
 );
 
+const MIN_WASM_OPT_VERSION = 123;
+
 const run = (cmd, args, opts = {}) =>
   execFileSync(cmd, args, { stdio: 'inherit', cwd: rootDir, ...opts });
 
@@ -59,19 +61,35 @@ run('wasm-bindgen', [
 ]);
 
 const wasmOut = join(distDir, 'libfreeform_bg.wasm');
-try {
-  const tmp = `${wasmOut}.opt`;
-  run('wasm-opt', [
-    '-O3',
-    '--enable-bulk-memory',
-    '--enable-nontrapping-float-to-int',
-    wasmOut,
-    '-o',
-    tmp,
-  ]);
-  renameSync(tmp, wasmOut);
-} catch {
-  console.warn('wasm-opt unavailable or failed; shipping unoptimized wasm');
+const wasmOptVersion = (() => {
+  try {
+    const output = execFileSync('wasm-opt', ['--version'], { encoding: 'utf8' });
+    return Number(output.match(/\d+/)?.[0]);
+  } catch {
+    return Number.NaN;
+  }
+})();
+if (!Number.isInteger(wasmOptVersion)) {
+  console.warn('wasm-opt unavailable; shipping unoptimized wasm');
+} else if (wasmOptVersion < MIN_WASM_OPT_VERSION) {
+  console.warn(
+    `wasm-opt ${wasmOptVersion} is too old; shipping unoptimized wasm to preserve externref tables`,
+  );
+} else {
+  try {
+    const tmp = `${wasmOut}.opt`;
+    run('wasm-opt', [
+      '-O3',
+      '--enable-bulk-memory',
+      '--enable-nontrapping-float-to-int',
+      wasmOut,
+      '-o',
+      tmp,
+    ]);
+    renameSync(tmp, wasmOut);
+  } catch {
+    console.warn('wasm-opt failed; shipping unoptimized wasm');
+  }
 }
 
 for (const entry of ['api.js', 'index.js', 'index.node.js', 'index.d.ts']) {

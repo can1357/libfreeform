@@ -105,7 +105,8 @@ fn tsu_value(value: &Plist) -> Result<TsuValue, FreeformDecodeError> {
 }
 
 /// Decodes the self-contained `CRLNativeData` tier without requiring TSU.
-/// The returned items retain every exact bounded owner-record range in
+///
+/// Returned items retain every exact bounded owner-record range in
 /// [`FreeformNative::raw_archive`]. `raw_data` remains the primary common
 /// record for schema-bounded dispatch. Without a TSU routing manifest items
 /// are deliberately `Unknown`; use [`join_crl_tsu`] only after the independent

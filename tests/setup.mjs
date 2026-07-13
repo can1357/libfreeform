@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-// Links the built npm package into tests/node_modules so every runtime
-// (Node, Bun, Deno-with-node_modules, and the browser page served by
-// serve.mjs) resolves `libfreeform` through real package.json `exports`.
-// A plain symlink keeps the link live across rebuilds — no reinstall.
+// (Node, Bun, and Deno with node_modules resolution) resolves `libfreeform`
+// through real package.json `exports`. A plain symlink keeps the link live
+// across rebuilds — no install step.
 
 import { existsSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';

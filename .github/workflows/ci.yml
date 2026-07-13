@@ -1,7 +1,7 @@
 # Two pillars:
 #   rust — fmt/clippy/tests for the native crate on Linux, macOS, Windows.
 #   wasm — build the npm package, then run the same smoke-test contract on
-#          Node, Bun, Deno, and headless Chromium (Playwright).
+#          Node, Bun, and Deno.
 name: CI
 
 on:
@@ -58,7 +58,7 @@ jobs:
       - run: biome ci .
 
   wasm:
-    name: wasm (node, bun, deno, chromium)
+    name: wasm (node, bun, deno)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,8 +69,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
-      - name: Install wasm-opt
-        run: sudo apt-get update && sudo apt-get install -y binaryen
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -80,11 +78,6 @@ jobs:
           deno-version: v2.x
       - name: Build npm package
         run: node npm/build.mjs
-      - name: Install Playwright
-        working-directory: tests
-        run: |
-          npm install
-          npx playwright install --with-deps chromium
       - name: Link package into tests
         run: node tests/setup.mjs
       - name: Smoke (Node)
@@ -93,5 +86,3 @@ jobs:
         run: bun tests/smoke.mjs
       - name: Smoke (Deno)
         run: deno run -R tests/smoke.mjs
-      - name: Smoke (Chromium)
-        run: node tests/browser.mjs

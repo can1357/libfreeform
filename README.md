@@ -139,7 +139,7 @@ The `com.apple.freeform.*` formats are private and can change with any Freeform 
 - `src/` — the parser (pure Rust rlib; published to crates.io)
 - `libfreeform-wasm/lib.rs` — target-gated wasm-bindgen module; the same crate emits it as a cdylib for npm
 - `npm/` — the npm package: entry points, types, build script
-- `tests/` — cross-runtime smoke tests (Node, Bun, Deno, headless Chromium)
+- `tests/` — cross-runtime smoke tests (Node, Bun, Deno)
 - `docs/FORMAT.md` — the reverse-engineered format documentation
 - `tools/dump_pasteboard.swift` — pasteboard capture utility
 - `tools/release.mjs` — synchronized Cargo/npm version commit and annotated-tag publisher
@@ -155,7 +155,7 @@ node npm/build.mjs                         # build the npm package into npm/dist
 node tests/setup.mjs && node tests/smoke.mjs   # runtime smoke (also: bun/deno)
 ```
 
-Building the npm package needs the `wasm32-unknown-unknown` target, a `wasm-bindgen` CLI matching the pin in root `Cargo.toml`, and optionally `wasm-opt` (binaryen). See [`RELEASING.md`](RELEASING.md) for the release process.
+Building the npm package needs the `wasm32-unknown-unknown` target and a `wasm-bindgen` CLI matching the pin in root `Cargo.toml`. `wasm-opt` is optional and only used at version 123 or newer. See [`RELEASING.md`](RELEASING.md) for the release process.
 
 ## License
 

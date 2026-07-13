@@ -132,13 +132,17 @@ if (resume ? cargoVersion !== version : cargoVersion === version) {
   throw new Error(resume ? `resume requires version ${version}` : `already at version ${version}`);
 }
 
-console.log(`${dryRun ? 'would release' : 'releasing'} ${resume ? 'resumed ' : ''}${cargoVersion}${resume ? '' : ` -> ${version}`} on ${branch}`);
+console.log(
+  `${dryRun ? 'would release' : 'releasing'} ${resume ? 'resumed ' : ''}${cargoVersion}${resume ? '' : ` -> ${version}`} on ${branch}`,
+);
 if (dryRun) {
   if (resume) {
     console.log(`would validate the staged version files, commit, tag ${tag}, and atomically push`);
   } else {
     console.log(`would update Cargo.toml, Cargo.lock, and npm/package.json`);
-    console.log(`would commit "chore: bumped to version ${version}", tag ${tag}, and atomically push`);
+    console.log(
+      `would commit "chore: bumped to version ${version}", tag ${tag}, and atomically push`,
+    );
   }
   process.exit(0);
 }

@@ -1,5 +1,5 @@
 // Runtime-agnostic contract checks for the published npm API. Harnesses supply
-// the same fixture bytes in Node, Bun, Deno, and Chromium.
+// the same fixture bytes in Node, Bun, and Deno.
 
 function assert(condition, message) {
   if (!condition) throw new Error(`check failed: ${message}`);
