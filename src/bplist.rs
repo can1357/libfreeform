@@ -1,30 +1,41 @@
-//! Minimal Apple binary property list (`bplist00`) reader.
+//! Strict Apple binary property list (`bplist00`) reader.
 //!
-//! Scoped to the object types that appear in Freeform's `TSUDescription`
-//! manifest and the index plist embedded in `CRLNativeData`: dictionaries,
-//! arrays, strings, integers, reals, booleans, data, and dates. It is not a
-//! general keyed-archive unarchiver. Reads are deliberately lenient —
-//! out-of-bounds bytes read as 0, structural damage returns `None` — because
-//! real blobs arrive truncated (e.g. partial Universal Clipboard transfers)
-//! and a plist parse must never panic.
+//! The reader supports the property-list types used by Freeform archives and
+//! rejects malformed or unsupported objects rather than inventing a value for
+//! them. Every span is constrained to the declared object area so embedded
+//! archive bytes cannot be mistaken for plist payload.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, mem::size_of, ops::Range};
 
-/// Plain plist value tree. Integers and UIDs parse as `Int`; reals and
-/// dates as `Real`.
+/// Plain binary-plist value tree.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Plist {
+   /// The plist null object.
    Null,
+   /// A boolean object.
    Bool(bool),
-   Int(u64),
+   /// A signed integer object.
+   Int(i64),
+   /// A floating-point number or date (seconds from the Apple reference date).
    Real(f64),
+   /// An ASCII or UTF-16 string.
    String(String),
+   /// An opaque byte string.
    Data(Vec<u8>),
+   /// An ordered array.
    Array(Vec<Self>),
+   /// An ordered set.
+   OrderedSet(Vec<Self>),
+   /// An unordered set.
+   Set(Vec<Self>),
+   /// A dictionary with string keys.
    Dict(HashMap<String, Self>),
+   /// A binary-plist UID, which is not an integer value.
+   Uid(u64),
 }
 
 impl Plist {
+   /// Returns the value as a string when it is one.
    pub fn as_str(&self) -> Option<&str> {
       match self {
          Self::String(s) => Some(s),
@@ -32,6 +43,7 @@ impl Plist {
       }
    }
 
+   /// Returns the value as an array when it is one.
    pub fn as_array(&self) -> Option<&[Self]> {
       match self {
          Self::Array(a) => Some(a),
@@ -39,6 +51,7 @@ impl Plist {
       }
    }
 
+   /// Returns the value as a dictionary when it is one.
    pub const fn as_dict(&self) -> Option<&HashMap<String, Self>> {
       match self {
          Self::Dict(d) => Some(d),
@@ -48,247 +61,380 @@ impl Plist {
 }
 
 const HEADER: &[u8; 8] = b"bplist00";
+const TRAILER_SIZE: usize = 32;
+const MAX_OBJECTS: usize = 100_000;
+const MAX_EXPANDED_OBJECTS: usize = 250_000;
+const MAX_DEPTH: u32 = 128;
+const MAX_COLLECTION_ENTRIES: usize = 100_000;
+const MAX_MATERIALIZED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TRAILER_CANDIDATES: usize = 4_096;
 
-/// Total object-parse budget: garbage offset tables (including cyclic
-/// object references) abort the parse instead of hanging.
-const PARSE_BUDGET: u64 = 250_000;
-/// Recursion cap: hostile nesting aborts instead of overflowing the stack.
-const MAX_DEPTH: u32 = 512;
-
-/// `b[i]` tolerating any index: out-of-range (including negative) is None.
-fn byte_at(b: &[u8], i: i64) -> Option<u8> {
-   if i < 0 {
-      None
-   } else {
-      b.get(i as usize).copied()
-   }
+#[derive(Clone, Copy)]
+struct Trailer {
+   offset_int_size:     usize,
+   object_ref_size:     usize,
+   num_objects:         usize,
+   top_object:          usize,
+   offset_table_offset: usize,
 }
 
-/// Read an unsigned big-endian integer of `size` bytes at `offset`, reading
-/// out-of-bounds bytes as 0. Widths beyond 8 bytes wrap — a garbage-only
-/// path; well-formed plists never emit them.
-fn read_uint(b: &[u8], offset: i64, size: u64) -> u64 {
-   let mut value: u64 = 0;
-   for i in 0..size.min(u32::MAX as u64) {
-      let byte = offset
-         .checked_add(i as i64)
-         .and_then(|at| byte_at(b, at))
-         .unwrap_or(0);
-      value = value.wrapping_mul(256).wrapping_add(byte as u64);
-   }
-   value
-}
-
-fn read_f32_be(b: &[u8], offset: usize) -> Option<f64> {
-   let bytes: [u8; 4] = b.get(offset..offset + 4)?.try_into().ok()?;
-   Some(f32::from_be_bytes(bytes) as f64)
-}
-
-fn read_f64_be(b: &[u8], offset: usize) -> Option<f64> {
-   let bytes: [u8; 8] = b.get(offset..offset + 8)?.try_into().ok()?;
-   Some(f64::from_be_bytes(bytes))
-}
-
-/// Locate a bounded `bplist00`'s length by its 32-byte trailer.
-///
-/// The index plist inside `CRLNativeData` does NOT run to EOF, so the trailer
-/// must be found rather than read from the end of the blob. `p0` is the
-/// offset of the `bplist00` header in `data`. `None` when no plausible
-/// trailer exists.
-pub fn bounded_plist_length(data: &[u8], p0: usize) -> Option<usize> {
-   if data.len() < 32 {
+/// Reads an exact, unsigned, big-endian integer with a supported plist width.
+fn read_uint(b: &[u8], offset: usize, width: usize) -> Option<u64> {
+   if !(1..=8).contains(&width) {
       return None;
    }
-   let mut p = p0.checked_add(8)?;
-   while p <= data.len() - 32 {
-      if data[p..p + 5].iter().any(|&c| c != 0) {
-         p += 1;
+   let bytes = b.get(offset..offset.checked_add(width)?)?;
+   Some(
+      bytes
+         .iter()
+         .fold(0_u64, |value, &byte| (value << 8) | byte as u64),
+   )
+}
+
+/// Reads an exact signed, big-endian integer with a supported plist width.
+fn read_int(b: &[u8], offset: usize, width: usize) -> Option<i64> {
+   let value = read_uint(b, offset, width)?;
+   let shift = 64_u32.checked_sub((width as u32).checked_mul(8)?)?;
+   Some(((value << shift) as i64) >> shift)
+}
+
+/// Reads and validates a binary plist trailer at `trailer_start`.
+fn trailer_at(b: &[u8], trailer_start: usize) -> Option<Trailer> {
+   let trailer = b.get(trailer_start..trailer_start.checked_add(TRAILER_SIZE)?)?;
+   if trailer[..6].iter().any(|&byte| byte != 0) {
+      return None;
+   }
+
+   let offset_int_size = trailer[6] as usize;
+   let object_ref_size = trailer[7] as usize;
+   if !(1..=8).contains(&offset_int_size) || !(1..=8).contains(&object_ref_size) {
+      return None;
+   }
+
+   let num_objects = usize::try_from(read_uint(trailer, 8, 8)?).ok()?;
+   let top_object = usize::try_from(read_uint(trailer, 16, 8)?).ok()?;
+   let offset_table_offset = usize::try_from(read_uint(trailer, 24, 8)?).ok()?;
+   if num_objects == 0 || num_objects > MAX_OBJECTS || top_object >= num_objects {
+      return None;
+   }
+   if offset_table_offset < HEADER.len() {
+      return None;
+   }
+   let offset_table_len = num_objects.checked_mul(offset_int_size)?;
+   if offset_table_offset.checked_add(offset_table_len)? != trailer_start {
+      return None;
+   }
+
+   Some(Trailer { offset_int_size, object_ref_size, num_objects, top_object, offset_table_offset })
+}
+
+/// Locate a complete bounded `bplist00` inside `data`.
+///
+/// The index plist inside `CRLNativeData` does not run to EOF. Candidate
+/// trailers are fully parsed before acceptance, so trailer-shaped bytes in an
+/// object payload do not hide the later, real trailer.
+pub fn bounded_plist_length(data: &[u8], p0: usize) -> Option<usize> {
+   if data.get(p0..p0.checked_add(HEADER.len())?)? != HEADER {
+      return None;
+   }
+   let first = p0.checked_add(HEADER.len())?;
+   let last = data.len().checked_sub(TRAILER_SIZE)?;
+   if first > last {
+      return None;
+   }
+
+   let mut candidates = 0_usize;
+   for trailer_start in first..=last {
+      let end = trailer_start.checked_add(TRAILER_SIZE)?;
+      let candidate = data.get(p0..end)?;
+      let local_trailer_start = trailer_start.checked_sub(p0)?;
+      if trailer_at(candidate, local_trailer_start).is_none() {
          continue;
       }
-      let offset_int_size = data[p + 6];
-      let object_ref_size = data[p + 7];
-      if !(1..=8).contains(&offset_int_size) || !(1..=8).contains(&object_ref_size) {
-         p += 1;
-         continue;
+      candidates = candidates.checked_add(1)?;
+      if candidates > MAX_TRAILER_CANDIDATES {
+         return None;
       }
-      let num_objects = read_uint(data, (p + 8) as i64, 8);
-      let top_object = read_uint(data, (p + 16) as i64, 8);
-      let offset_table_offset = read_uint(data, (p + 24) as i64, 8);
-      let length = (p + 32 - p0) as u64;
-      if num_objects > 0
-         && num_objects < 1_000_000
-         && top_object < num_objects
-         && offset_table_offset >= 8
-         && offset_table_offset < length
-      {
-         return Some(length as usize);
+      if parse_bplist(candidate).is_some() {
+         return end.checked_sub(p0);
       }
-      p += 1;
    }
    None
 }
 
 struct Parser<'a> {
    b:                   &'a [u8],
-   object_ref_size:     u64,
-   offset_int_size:     u64,
-   offset_table_offset: u64,
-   num_objects:         u64,
-   budget:              u64,
+   object_ref_size:     usize,
+   offset_table_offset: usize,
+   object_offsets:      Vec<usize>,
+   expanded_objects:    usize,
+   materialized_bytes:  usize,
 }
 
-impl Parser<'_> {
-   /// Offset-table entry for `index`; `None` when `index` is beyond the
-   /// table.
-   fn offset_at(&self, index: u64) -> Option<i64> {
-      if index >= self.num_objects {
-         return None;
+impl<'a> Parser<'a> {
+   fn new(b: &'a [u8], trailer: Trailer) -> Result<Self, ()> {
+      let mut object_offsets = Vec::new();
+      object_offsets
+         .try_reserve_exact(trailer.num_objects)
+         .map_err(|_| ())?;
+      for index in 0..trailer.num_objects {
+         let entry = trailer
+            .offset_table_offset
+            .checked_add(index.checked_mul(trailer.offset_int_size).ok_or(())?)
+            .ok_or(())?;
+         let offset = usize::try_from(read_uint(b, entry, trailer.offset_int_size).ok_or(())?)
+            .map_err(|_| ())?;
+         if !(HEADER.len()..trailer.offset_table_offset).contains(&offset) {
+            return Err(());
+         }
+         object_offsets.push(offset);
       }
-      let at = (self.offset_table_offset as u128 + index as u128 * self.offset_int_size as u128)
-         .min(i64::MAX as u128) as i64;
-      Some(read_uint(self.b, at, self.offset_int_size).min(i64::MAX as u64) as i64)
-   }
-
-   /// Object count, resolving the `0x_F` escape to a following int object.
-   fn count_at(&self, pos: i64, info: u8) -> (u64, i64) {
-      if info != 0x0f {
-         return (info as u64, pos + 1);
-      }
-      // Int marker 0x1_, low nibble = log2(bytes); the high nibble is not
-      // verified — real encoders always emit an int object here.
-      let size_pow = byte_at(self.b, pos + 1).unwrap_or(0);
-      let int_bytes = 1u64 << (size_pow & 0x0f);
-      (read_uint(self.b, pos + 2, int_bytes), pos.saturating_add(2 + int_bytes as i64))
-   }
-
-   /// Parse the object at table `index`. `Err(())` aborts the whole parse
-   /// (float read past the buffer, exhausted budget or depth).
-   fn object(&mut self, index: u64, depth: u32) -> Result<Plist, ()> {
-      if depth > MAX_DEPTH || self.budget == 0 {
-         return Err(());
-      }
-      self.budget -= 1;
-      let Some(start) = self.offset_at(index) else {
-         return Ok(Plist::Null);
-      };
-      let marker = byte_at(self.b, start).unwrap_or(0);
-      let type_nibble = marker & 0xf0;
-      let info = marker & 0x0f;
-      let len = self.b.len() as i64;
-
-      Ok(match type_nibble {
-         0x00 => match marker {
-            0x08 => Plist::Bool(false),
-            0x09 => Plist::Bool(true),
-            _ => Plist::Null,
-         },
-         0x10 => Plist::Int(read_uint(self.b, start + 1, 1u64 << info)),
-         0x20 => {
-            // Float object of `1 << info` bytes; one that runs past the
-            // buffer or is under 4 bytes aborts the parse.
-            let size = 1i64 << info;
-            if start + 1 + size > len {
-               return Err(());
-            }
-            if info == 3 {
-               Plist::Real(read_f64_be(self.b, (start + 1) as usize).ok_or(())?)
-            } else if size >= 4 {
-               Plist::Real(read_f32_be(self.b, (start + 1) as usize).ok_or(())?)
-            } else {
-               return Err(());
-            }
-         },
-         0x30 => Plist::Real(read_f64_be(self.b, (start + 1) as usize).ok_or(())?),
-         0x40 => {
-            let (count, data_start) = self.count_at(start, info);
-            let from = data_start.clamp(0, len) as usize;
-            let to = data_start
-               .saturating_add(count.min(i64::MAX as u64) as i64)
-               .clamp(0, len) as usize;
-            Plist::Data(self.b[from..to.max(from)].to_vec())
-         },
-         0x50 => {
-            // ASCII (really Latin-1: each byte maps to the same code
-            // point). Bytes past the buffer end the string.
-            let (count, data_start) = self.count_at(start, info);
-            let mut s = String::new();
-            for i in 0..count {
-               let Some(c) = byte_at(self.b, data_start.saturating_add(i as i64)) else {
-                  break;
-               };
-               s.push(c as char);
-            }
-            Plist::String(s)
-         },
-         0x60 => {
-            // UTF-16BE code units; invalid surrogates become U+FFFD.
-            let (count, data_start) = self.count_at(start, info);
-            let mut units: Vec<u16> = Vec::new();
-            for i in 0..count {
-               let at = data_start.saturating_add(i as i64 * 2);
-               if byte_at(self.b, at).is_none() {
-                  break;
-               }
-               units.push(read_uint(self.b, at, 2) as u16);
-            }
-            Plist::String(String::from_utf16_lossy(&units))
-         },
-         0x80 => Plist::Int(read_uint(self.b, start + 1, info as u64 + 1)),
-         0xa0 => {
-            let (count, data_start) = self.count_at(start, info);
-            let mut out: Vec<Plist> = Vec::new();
-            for i in 0..count {
-               let at = data_start.saturating_add((i * self.object_ref_size) as i64);
-               let child = self.object(read_uint(self.b, at, self.object_ref_size), depth + 1)?;
-               out.push(child);
-            }
-            Plist::Array(out)
-         },
-         0xd0 => {
-            let (count, data_start) = self.count_at(start, info);
-            let value_base = data_start
-               .saturating_add((count.min(i64::MAX as u64 / 256) * self.object_ref_size) as i64);
-            let mut out: HashMap<String, Plist> = HashMap::new();
-            for i in 0..count {
-               let key_at = data_start.saturating_add((i * self.object_ref_size) as i64);
-               let value_at = value_base.saturating_add((i * self.object_ref_size) as i64);
-               let key = self.object(read_uint(self.b, key_at, self.object_ref_size), depth + 1)?;
-               let value =
-                  self.object(read_uint(self.b, value_at, self.object_ref_size), depth + 1)?;
-               if let Plist::String(key) = key {
-                  out.insert(key, value);
-               }
-            }
-            Plist::Dict(out)
-         },
-         _ => Plist::Null,
+      Ok(Self {
+         b,
+         object_ref_size: trailer.object_ref_size,
+         offset_table_offset: trailer.offset_table_offset,
+         object_offsets,
+         expanded_objects: 0,
+         materialized_bytes: 0,
       })
    }
+
+   fn object_span(&self, start: usize, len: usize) -> Result<Range<usize>, ()> {
+      let end = start.checked_add(len).ok_or(())?;
+      if start < HEADER.len() || end > self.offset_table_offset {
+         return Err(());
+      }
+      Ok(start..end)
+   }
+
+   fn charge_bytes(&mut self, len: usize) -> Result<(), ()> {
+      self.materialized_bytes = self.materialized_bytes.checked_add(len).ok_or(())?;
+      if self.materialized_bytes > MAX_MATERIALIZED_BYTES {
+         return Err(());
+      }
+      Ok(())
+   }
+
+   /// Returns the object count and byte offset after a length encoding.
+   fn count_at(&self, start: usize, info: u8) -> Result<(usize, usize), ()> {
+      if info != 0x0f {
+         return Ok((info as usize, start.checked_add(1).ok_or(())?));
+      }
+      let count_marker_at = start.checked_add(1).ok_or(())?;
+      let count_marker = *self.b.get(count_marker_at).ok_or(())?;
+      if count_marker & 0xf0 != 0x10 {
+         return Err(());
+      }
+      let width = 1_usize
+         .checked_shl((count_marker & 0x0f) as u32)
+         .ok_or(())?;
+      if width > 8 {
+         return Err(());
+      }
+      let count_data_at = count_marker_at.checked_add(1).ok_or(())?;
+      self.object_span(count_marker_at, 1_usize.checked_add(width).ok_or(())?)?;
+      let count = read_int(self.b, count_data_at, width).ok_or(())?;
+      if count < 0 {
+         return Err(());
+      }
+      Ok((usize::try_from(count).map_err(|_| ())?, count_data_at.checked_add(width).ok_or(())?))
+   }
+
+   fn reference_at(&self, at: usize) -> Result<usize, ()> {
+      let reference =
+         usize::try_from(read_uint(self.b, at, self.object_ref_size).ok_or(())?).map_err(|_| ())?;
+      if reference >= self.object_offsets.len() {
+         return Err(());
+      }
+      Ok(reference)
+   }
+
+   fn collection(&mut self, refs_start: usize, count: usize, depth: u32) -> Result<Vec<Plist>, ()> {
+      if count > MAX_COLLECTION_ENTRIES {
+         return Err(());
+      }
+      let refs_len = count.checked_mul(self.object_ref_size).ok_or(())?;
+      self.object_span(refs_start, refs_len)?;
+      self.charge_bytes(count.checked_mul(size_of::<Plist>()).ok_or(())?)?;
+      let mut values = Vec::new();
+      values.try_reserve_exact(count).map_err(|_| ())?;
+      for index in 0..count {
+         let at = refs_start
+            .checked_add(index.checked_mul(self.object_ref_size).ok_or(())?)
+            .ok_or(())?;
+         values.push(self.object(self.reference_at(at)?, depth.checked_add(1).ok_or(())?)?);
+      }
+      Ok(values)
+   }
+
+   fn dictionary(
+      &mut self,
+      refs_start: usize,
+      count: usize,
+      depth: u32,
+   ) -> Result<HashMap<String, Plist>, ()> {
+      if count > MAX_COLLECTION_ENTRIES {
+         return Err(());
+      }
+      let refs_len = count
+         .checked_mul(self.object_ref_size)
+         .and_then(|len| len.checked_mul(2))
+         .ok_or(())?;
+      self.object_span(refs_start, refs_len)?;
+      // Covers the hash-table entries and limits intentionally repeated keys.
+      self.charge_bytes(count.checked_mul(128).ok_or(())?)?;
+      let value_base = refs_start
+         .checked_add(count.checked_mul(self.object_ref_size).ok_or(())?)
+         .ok_or(())?;
+      let mut values = HashMap::new();
+      values.try_reserve(count).map_err(|_| ())?;
+      for index in 0..count {
+         let key_at = refs_start
+            .checked_add(index.checked_mul(self.object_ref_size).ok_or(())?)
+            .ok_or(())?;
+         let value_at = value_base
+            .checked_add(index.checked_mul(self.object_ref_size).ok_or(())?)
+            .ok_or(())?;
+         let key = self.object(self.reference_at(key_at)?, depth.checked_add(1).ok_or(())?)?;
+         let Plist::String(key) = key else {
+            return Err(());
+         };
+         if values.contains_key(&key) {
+            return Err(());
+         }
+         let value = self.object(self.reference_at(value_at)?, depth.checked_add(1).ok_or(())?)?;
+         values.insert(key, value);
+      }
+      Ok(values)
+   }
+
+   fn object(&mut self, index: usize, depth: u32) -> Result<Plist, ()> {
+      if depth > MAX_DEPTH || self.expanded_objects >= MAX_EXPANDED_OBJECTS {
+         return Err(());
+      }
+      self.expanded_objects += 1;
+      let start = *self.object_offsets.get(index).ok_or(())?;
+      let marker = *self.b.get(start).ok_or(())?;
+      let object_type = marker & 0xf0;
+      let info = marker & 0x0f;
+
+      match object_type {
+         0x00 => match marker {
+            0x00 => Ok(Plist::Null),
+            0x08 => Ok(Plist::Bool(false)),
+            0x09 => Ok(Plist::Bool(true)),
+            _ => Err(()),
+         },
+         0x10 => {
+            let width = 1_usize.checked_shl(info as u32).ok_or(())?;
+            if width > 8 {
+               return Err(());
+            }
+            let value_at = self
+               .object_span(start, 1_usize.checked_add(width).ok_or(())?)?
+               .start
+               + 1;
+            Ok(Plist::Int(read_int(self.b, value_at, width).ok_or(())?))
+         },
+         0x20 => {
+            let width = match info {
+               2 => 4,
+               3 => 8,
+               _ => return Err(()),
+            };
+            let value_at = self.object_span(start, 1 + width)?.start + 1;
+            let value = match width {
+               4 => f32::from_be_bytes(self.b[value_at..value_at + 4].try_into().map_err(|_| ())?)
+                  as f64,
+               8 => f64::from_be_bytes(self.b[value_at..value_at + 8].try_into().map_err(|_| ())?),
+               _ => return Err(()),
+            };
+            Ok(Plist::Real(value))
+         },
+         0x30 => {
+            if info != 3 {
+               return Err(());
+            }
+            let value_at = self.object_span(start, 9)?.start + 1;
+            Ok(Plist::Real(f64::from_be_bytes(
+               self.b[value_at..value_at + 8].try_into().map_err(|_| ())?,
+            )))
+         },
+         0x40 => {
+            let (count, data_at) = self.count_at(start, info)?;
+            let span = self.object_span(data_at, count)?;
+            self.charge_bytes(count)?;
+            Ok(Plist::Data(self.b[span].to_vec()))
+         },
+         0x50 => {
+            let (count, string_at) = self.count_at(start, info)?;
+            let span = self.object_span(string_at, count)?;
+            let text = std::str::from_utf8(&self.b[span]).map_err(|_| ())?;
+            if !text.is_ascii() {
+               return Err(());
+            }
+            self.charge_bytes(count)?;
+            Ok(Plist::String(text.to_owned()))
+         },
+         0x60 => {
+            let (count, string_at) = self.count_at(start, info)?;
+            let byte_count = count.checked_mul(2).ok_or(())?;
+            let span = self.object_span(string_at, byte_count)?;
+            // Every UTF-16 code unit could encode to three UTF-8 bytes.
+            self.charge_bytes(count.checked_mul(3).ok_or(())?)?;
+            let mut units = Vec::new();
+            units.try_reserve_exact(count).map_err(|_| ())?;
+            for bytes in self.b[span].chunks_exact(2) {
+               units.push(u16::from_be_bytes(bytes.try_into().map_err(|_| ())?));
+            }
+            Ok(Plist::String(String::from_utf16(&units).map_err(|_| ())?))
+         },
+         0x80 => {
+            let width = info as usize + 1;
+            if width > 8 {
+               return Err(());
+            }
+            let value_at = self
+               .object_span(start, 1_usize.checked_add(width).ok_or(())?)?
+               .start
+               + 1;
+            Ok(Plist::Uid(read_uint(self.b, value_at, width).ok_or(())?))
+         },
+         0xa0 | 0xb0 | 0xc0 => {
+            let (count, refs_start) = self.count_at(start, info)?;
+            let values = self.collection(refs_start, count, depth)?;
+            Ok(match object_type {
+               0xa0 => Plist::Array(values),
+               0xb0 => Plist::OrderedSet(values),
+               0xc0 => Plist::Set(values),
+               _ => return Err(()),
+            })
+         },
+         0xd0 => {
+            let (count, refs_start) = self.count_at(start, info)?;
+            Ok(Plist::Dict(self.dictionary(refs_start, count, depth)?))
+         },
+         _ => Err(()),
+      }
+   }
 }
 
-/// Parse a `bplist00` byte slice (offset 0 must be the header) into plain
-/// values. `None` on a bad header or structural damage (malformed floats,
-/// exhausted parse budget).
+/// Parse a complete `bplist00` byte slice into a lossless supported value tree.
+///
+/// The input must contain a valid header, 32-byte trailer, offset table, and
+/// bounded objects. Malformed, oversized, cyclic, or unsupported input returns
+/// `None` without partially decoding it.
 pub fn parse_bplist(b: &[u8]) -> Option<Plist> {
-   if b.len() < HEADER.len() || &b[..HEADER.len()] != HEADER {
+   if b.get(..HEADER.len())? != HEADER {
       return None;
    }
-   let trailer = b.len() as i64 - 32;
-   let offset_int_size = byte_at(b, trailer + 6).unwrap_or(1) as u64;
-   let object_ref_size = byte_at(b, trailer + 7).unwrap_or(1) as u64;
-   let num_objects = read_uint(b, trailer + 8, 8);
-   let top_object = read_uint(b, trailer + 16, 8);
-   let offset_table_offset = read_uint(b, trailer + 24, 8);
-
-   let mut parser = Parser {
-      b,
-      object_ref_size,
-      offset_int_size,
-      offset_table_offset,
-      num_objects,
-      budget: PARSE_BUDGET,
-   };
-   parser.object(top_object, 0).ok()
+   let trailer_start = b.len().checked_sub(TRAILER_SIZE)?;
+   if trailer_start < HEADER.len() {
+      return None;
+   }
+   let trailer = trailer_at(b, trailer_start)?;
+   let mut parser = Parser::new(b, trailer).ok()?;
+   parser.object(trailer.top_object, 0).ok()
 }
 
 #[cfg(test)]
@@ -297,6 +443,24 @@ mod tests {
 
    const TSU: &[u8] = include_bytes!("../fixtures/native-mixed.tsudescription");
    const CRL: &[u8] = include_bytes!("../fixtures/native-mixed.crlnative");
+
+   fn plist(objects: &[&[u8]], top_object: usize) -> Vec<u8> {
+      assert!(u8::try_from(objects.len()).is_ok());
+      let mut output = HEADER.to_vec();
+      let mut offsets = Vec::new();
+      for object in objects {
+         offsets.push(u8::try_from(output.len()).unwrap());
+         output.extend_from_slice(object);
+      }
+      let table_offset = output.len();
+      output.extend(offsets);
+      output.extend([0; 6]);
+      output.extend([1, 1]);
+      output.extend_from_slice(&(objects.len() as u64).to_be_bytes());
+      output.extend_from_slice(&(top_object as u64).to_be_bytes());
+      output.extend_from_slice(&(table_offset as u64).to_be_bytes());
+      output
+   }
 
    #[test]
    fn parses_the_tsu_manifest_dict() {
@@ -312,21 +476,82 @@ mod tests {
    }
 
    #[test]
-   fn rejects_a_bad_header() {
-      assert_eq!(parse_bplist(b"notaplist00"), None);
-      assert_eq!(parse_bplist(b"bpl"), None);
-   }
-
-   #[test]
    fn locates_a_bounded_plist_trailer() {
-      // The crlnative fixture embeds a bounded index plist after the 8-byte
-      // manifest-length prefix + manifest.
       let manifest_len = u64::from_le_bytes(CRL[..8].try_into().unwrap()) as usize;
       let p0 = 8 + manifest_len;
-      assert_eq!(&CRL[p0..p0 + 8], b"bplist00");
+      assert_eq!(&CRL[p0..p0 + 8], HEADER);
       let len = bounded_plist_length(CRL, p0).expect("trailer found");
       assert!(len >= 40 && p0 + len < CRL.len());
       assert!(parse_bplist(&CRL[p0..p0 + len]).is_some());
+   }
+
+   #[test]
+   fn rejects_incomplete_and_bad_headers() {
+      assert_eq!(parse_bplist(b"notaplist00"), None);
+      assert_eq!(parse_bplist(b"bpl"), None);
+      assert_eq!(parse_bplist(b"bplist00"), None);
+   }
+
+   #[test]
+   fn retains_negative_integers_and_distinct_uids() {
+      assert_eq!(parse_bplist(&plist(&[&[0x10, 0xff]], 0)), Some(Plist::Int(-1)));
+      assert_eq!(parse_bplist(&plist(&[&[0x80, 0xff]], 0)), Some(Plist::Uid(255)));
+   }
+
+   #[test]
+   fn skips_a_trailer_shaped_invalid_prefix() {
+      let mut embedded = HEADER.to_vec();
+      embedded.push(7); // An invalid offset for the apparent one-object prefix.
+      embedded.extend([0; 6]);
+      embedded.extend([1, 1]);
+      embedded.extend_from_slice(&1_u64.to_be_bytes());
+      embedded.extend_from_slice(&0_u64.to_be_bytes());
+      embedded.extend_from_slice(&8_u64.to_be_bytes());
+      embedded.push(0x08);
+      let offset_table = embedded.len();
+      embedded.push(41);
+      embedded.extend([0; 6]);
+      embedded.extend([1, 1]);
+      embedded.extend_from_slice(&1_u64.to_be_bytes());
+      embedded.extend_from_slice(&0_u64.to_be_bytes());
+      embedded.extend_from_slice(&(offset_table as u64).to_be_bytes());
+      assert_eq!(bounded_plist_length(&embedded, 0), Some(embedded.len()));
+      assert_eq!(parse_bplist(&embedded), Some(Plist::Bool(false)));
+   }
+
+   #[test]
+   fn rejects_invalid_widths_offsets_and_unknown_markers() {
+      let mut invalid_width = plist(&[&[0x08]], 0);
+      let trailer = invalid_width.len() - TRAILER_SIZE;
+      invalid_width[trailer + 6] = 0;
+      assert_eq!(parse_bplist(&invalid_width), None);
+
+      let mut invalid_offset = plist(&[&[0x08]], 0);
+      let offset_entry = invalid_offset.len() - TRAILER_SIZE - 1;
+      invalid_offset[offset_entry] = 7;
+      assert_eq!(parse_bplist(&invalid_offset), None);
+      assert_eq!(parse_bplist(&plist(&[&[0x70]], 0)), None);
+   }
+
+   #[test]
+   fn parses_sets_without_coercing_them_to_arrays() {
+      let objects = [&[0xb1, 2][..], &[0xc1, 2][..], &[0x09][..]];
+      assert_eq!(
+         parse_bplist(&plist(&objects, 0)),
+         Some(Plist::OrderedSet(vec![Plist::Bool(true)]))
+      );
+      assert_eq!(parse_bplist(&plist(&objects, 1)), Some(Plist::Set(vec![Plist::Bool(true)])));
+   }
+
+   #[test]
+   fn rejects_excessive_shared_reference_expansion() {
+      let mut objects = Vec::new();
+      for index in 0..18_u8 {
+         objects.push(vec![0xa2, index + 1, index + 1]);
+      }
+      objects.push(vec![0x09]);
+      let refs: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
+      assert_eq!(parse_bplist(&plist(&refs, 0)), None);
    }
 
    #[test]

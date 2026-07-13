@@ -17,25 +17,26 @@
 
 ## 0. TL;DR — what to actually use
 
-Freeform writes the *same* selection to the pasteboard in several parallel
-representations. Pick the highest tier you can decode:
+Freeform writes the same selection in several parallel representations. Preserve
+all of them: each tier has different stability and fallback value.
 
-| Need | Use | Fidelity |
+| Need | Flavor | Library result |
 |---|---|---|
-| Just pixels | `public.png` / `public.tiff` | lossy, flat raster |
-| **Freehand ink (strokes)** | **`com.apple.drawing` → `PKDrawing`** | **lossless vector: per-point position, width, force, ink, color** |
-| Quick "what's selected" | `com.apple.freeform.TSUDescription` | item class manifest (a plist) |
-| Everything (geometry, text, style, connectors) | `com.apple.freeform.CRLNativeData` | full native graph — undocumented, hard |
+| Pixels | `public.png` / `public.tiff` / PDF | ordered `FreeformRender` fallbacks |
+| Freehand ink | `com.apple.drawing` | local B-spline controls, affine transform, proven point channels, exact ink metadata, raw stroke record |
+| Item inventory | `com.apple.freeform.TSUDescription` | ordered classes and recursive typed hints |
+| Native scene | `com.apple.freeform.CRLNativeData` | record-bounded typed items plus retained unknown records |
+| Assets and routing state | `CRLAsset.*`, metadata/state/style/text flavors | exact bytes, correlation metadata, and typed known state |
 
-**Recommendation:** decode ink via `PKDrawing` (Tier 2 — clean and
-stable, it's a public framework). Use `TSUDescription` (Tier 3) to know which
-non-ink shapes are present. Decode `CRLNativeData` (Tier 4) only for the shape
-geometry/text that PencilKit can't give you, and treat it as best-effort.
+Apple's `PKDrawing(data:)` remains the highest-fidelity ink renderer. The pure
+Rust decoder does not call PencilKit: it preserves the private packed controls
+and every proven channel, but keeps unsupported channels in `rawData` rather
+than describing the result as a rendered sample.
 
 > **Tooling.** [`tools/dump_pasteboard.swift`](../tools/dump_pasteboard.swift)
-> captures every flavor to disk; the library in this repository decodes them
-> (Rust: `libfreeform`, npm: `libfreeform`). A worked native→SVG round-trip is
-> described in §3.5.
+> captures an atomic flavor snapshot with an exact UTI manifest. The Rust and
+> npm packages decode that snapshot into independent tier outcomes; one damaged
+> flavor never discards another usable tier.
 
 `CRL` = Freeform's internal class prefix. The app is built on the iWork shared
 stack (the `TS*` frameworks: `TSUtility`, `TSAccessibility`, …), so the native
@@ -310,40 +311,43 @@ the graph; `…HasPremiumContent` ⇒ expect missing asset bytes (reference only
 
 ## 6. Recommended import pipeline
 
-1. Snapshot the pasteboard (Swift, §2). Record `changeCount`.
-2. Read `pasteboardState.*` (§5) to classify the selection.
-3. **Ink:** if any freehand present, decode `com.apple.drawing` → `PKDrawing`
-   (§3.2). Emit ink: feed each stroke's `{x, y, pressure}` (after
-   `transform`) into a variable-width outline (e.g. perfect-freehand). This is
-   lossless and stable — do it first.
-4. **Non-ink shapes:** zip `TSUDescription.boardItems` with `CRLNativeData`'s
-   index `boardItems` (§3.3) to get `(UUID, class, hints)` per item. For each
-   non-freehand item, decode its `CRLProto_*` record from `CRLNativeData §C`
-   (§3.4) → map onto your scene model (rect/oval/text/sticky/connector/table/image).
-5. **Assets:** for image/movie items, copy the `com.apple.freeform.CRLAsset.<id>`
-   bytes out verbatim.
-6. **Fallback:** if `hasNativeTypes` is false or the version check fails, fall
-   back to `public.png`.
-
-Keep Tier-2 (ink) and Tier-4 (native) decoupled — Tier 2 alone already covers
-the most common "I sketched something, import it" case losslessly.
+1. Capture an atomic snapshot with `tools/dump_pasteboard.swift`. The generated
+   `manifest.json` is authoritative for UTI names, flavor order, filenames, and
+   `changeCount`.
+2. Pass every exact UTI/byte pair to `decodePasteboard`; do not pre-collapse
+   dynamic assets or state flags into fixed slots.
+3. Check each `FreeformTier`: `decoded`, `failed`, or `absent`. Keep TSU,
+   native, drawing, and rendered fallbacks independent.
+4. Treat `com.apple.drawing` as the canonical ink source when it decodes.
+   Points are local B-spline controls; apply the preserved affine transform or
+   sample the spline before rendering.
+5. Use the strictly correlated TSU/native result for non-ink items. Item kinds
+   retain geometry/style, paths, styled text, connector endpoints, table cells,
+   assets/media, group relationships, and bounded raw data for unsupported
+   fields.
+6. Resolve `CRLAsset.<id>` bytes through `FreeformNative.assets`. A missing
+   payload with premium state is expected; an unmatched or truncated asset is a
+   diagnostic rather than an invented image.
+7. Fall back to the ordered render flavors when native compatibility or a tier
+   failure prevents the required fidelity.
 
 ---
 
 ## 7. Caveats
 
-- **Unstable.** `CRLNativeData §C` schema can change with any Freeform/OS update.
-  Read a `SchemaVersion`/`CRLProto_ObjectMetadata` field and refuse unknown
-  versions rather than mis-decode.
-- **CRDT noise.** Section C carries collaboration metadata you must skip; don't
-  assume a record maps 1:1 to a visible item.
-- **`PKDrawing` is the exception** — public API, version-tolerant. Lean on it.
-- Universal Clipboard (copy on iPad, paste on Mac) yields the same types, but a
-  partial transfer can drop the large `CRLNativeData`/`CRLAsset` blobs and leave
-  only the render — handle missing types gracefully.
-- **Premium/stock media has no bytes.** An image/movie flagged
-  `containsPremiumContent` ships only a reference (`<UUID>.jpg` + thumbnail) plus
-  the render — no `CRLAsset` blob. Use `public.png` or re-fetch from source.
+- **Unstable native schema.** The decoder validates the CRL envelope, index,
+  manifest, UUIDs, record ownership, and known compatibility metadata before
+  semantic decoding. Unsupported record fields remain in `rawData`.
+- **CRDT object graph.** Section C contains references and nested collaboration
+  records. Values are associated only inside bounded owner records, never by
+  nearest byte offset.
+- **Private PencilKit bytes.** PencilKit's framework API is version-tolerant;
+  the Rust byte decoder is a versioned reverse-engineered subset with raw
+  fallback for unproven channels.
+- **Partial transfer.** Universal Clipboard may leave only TSU or a render.
+  Independent tier outcomes preserve those useful fallbacks.
+- **Premium media.** Premium image/movie items can carry descriptors and a
+  render without a `CRLAsset` payload. Absence is represented explicitly.
 
 ---
 
@@ -358,13 +362,14 @@ The reliable way to nail §3.4/§4 for a given shape is **differential analysis*
 4. Repeat per shape kind: rectangle, oval, sticky note, text box, arrow/
    connector, table, image, group.
 
-**What's verified now (three fixtures):** the §3.4 A/B/C layout; the
-`TSUDescription`↔index join; the presence/structure of ink, shapes, text boxes,
-sticky notes, connectors, tables, and images; **text content (TSWP field 1),
-font size (propID 10), and sRGB fill colors (propID 9 / `#14`+`#15` channels)**;
-and that **tables are self-contained** (cell text + embedded shapes nest inside
-the single table item). **Still open:** (1) numeric **geometry** field offsets —
-position/size/transform, connector endpoints (single-property diffs, step 3);
-(2) labelling the remaining character propIDs (`bold` / `paragraphAlignment` /
-`listStyle` — values decode, names need a diff); (3) a **non-premium image**
-paste to capture a real `com.apple.freeform.CRLAsset.<id>` blob end-to-end.
+**Verified by the checked-in real and synthetic fixtures:** strict A/B/C
+envelope parsing; canonical UUID and manifest/index reconciliation; independent
+TSU parsing and recursive hints; bounded item dispatch; local geometry and
+flips; preset and Bézier path retention; solid/gradient style records; native
+ink channels and transforms; connector/group references; styled text and table
+cell structure; media descriptors and dynamic asset joins; and lossless raw
+fallbacks for fields not yet mapped.
+
+New OS releases and shape-specific fields still require differential captures:
+change one property, capture atomically, and add the resulting record mapping
+only when its ownership, wire type, and semantics are independently established.

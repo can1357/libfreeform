@@ -6,15 +6,16 @@ Parser for Apple **Freeform** pasteboard data — Rust core, WebAssembly binding
 [![crates.io](https://img.shields.io/crates/v/libfreeform)](https://crates.io/crates/libfreeform)
 [![npm](https://img.shields.io/npm/v/libfreeform)](https://www.npmjs.com/package/libfreeform)
 
-When you copy board items in Freeform, macOS/iPadOS writes the same selection to the pasteboard in several parallel flavors. None of the `com.apple.freeform.*` formats are documented; this library decodes them anyway — reverse-engineered, fixture-verified, no Apple frameworks required:
+Freeform writes one selection in several parallel pasteboard flavors. This library snapshots every flavor, decodes supported tiers independently, and retains unknown records and bytes for newer decoders:
 
-| Pasteboard flavor | What it carries | Decoder |
-|---|---|---|
-| `com.apple.drawing` | PencilKit `PKDrawing`: every freehand stroke with per-point position, width, pressure, plus ink family/color/opacity | `decodePkDrawing` |
-| `com.apple.freeform.CRLNativeData` | The native object graph: board-item frames (position/size/rotation), fills, text, shape outlines, embedded ink | `decodeCrlNative` |
-| `com.apple.freeform.TSUDescription` | Board-item class manifest (`CRLWPStickyNoteItem`, `CRLTableItem`, …) + routing hints | `parseTsuDescription` |
+| Pasteboard flavor | Decoded data |
+|---|---|
+| `com.apple.drawing` | PencilKit spline controls, full affine transforms, proven point channels, exact ink identifiers, and raw stroke records |
+| `com.apple.freeform.CRLNativeData` | Typed, record-bounded board items: geometry/style, shapes, text, connectors, tables, media, groups, and native ink |
+| `com.apple.freeform.TSUDescription` | Ordered item classes and recursive routing hints |
+| `CRLNativeMetadata`, `CRLAsset.*`, state/style/text/render flavors | Correlation metadata, embedded assets, state flags, style/text selections, and PNG/TIFF/PDF fallbacks |
 
-`decodePasteboard` assembles whatever flavors are present into one normalized selection. Decoding is **best-effort by design**: a damaged or unsupported tier degrades to a missing tier, and no input — truncated, corrupt, or hostile — panics or throws unexpectedly. The wire formats are documented in [`docs/FORMAT.md`](docs/FORMAT.md).
+`decodePasteboard` returns a `decoded`, `failed`, or `absent` outcome for each independent tier. A damaged TSU manifest cannot discard valid native data; mismatched tiers are reported instead of partially joined. Private CRL formats remain OS-version fragile, so unsupported fields retain their bounded raw records rather than receiving guessed values. The wire formats are documented in [`docs/FORMAT.md`](docs/FORMAT.md).
 
 ## Rust
 
@@ -23,21 +24,43 @@ cargo add libfreeform
 ```
 
 ```rust
-use libfreeform::{FreeformBlobs, decode_pasteboard};
-
-let blobs = FreeformBlobs {
-    drawing: std::fs::read("pb_dump/com_apple_drawing").ok(),
-    crl_native: std::fs::read("pb_dump/com_apple_freeform_CRLNativeData").ok(),
-    tsu_description: std::fs::read("pb_dump/com_apple_freeform_TSUDescription").ok(),
-    render_png: None,
+use libfreeform::{
+    FreeformBlobs, FreeformFlavor, FreeformTier, decode_pasteboard,
 };
-let decoded = decode_pasteboard(blobs);
 
-for stroke in decoded.drawing.iter().flat_map(|d| &d.strokes) {
-    println!("{} stroke, {} points, {}", stroke.ink_type, stroke.points.len(), stroke.color);
+let flavors = [
+    ("com.apple.drawing", "pb_dump/flavor-000003.bin"),
+    (
+        "com.apple.freeform.CRLNativeData",
+        "pb_dump/flavor-000001.bin",
+    ),
+    (
+        "com.apple.freeform.TSUDescription",
+        "pb_dump/flavor-000002.bin",
+    ),
+]
+.into_iter()
+.filter_map(|(uti, path)| {
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| FreeformFlavor { uti: uti.into(), bytes })
+})
+.collect();
+
+let decoded = decode_pasteboard(FreeformBlobs {
+    change_count: None,
+    flavors,
+});
+
+if let FreeformTier::Decoded(drawing) = decoded.drawing {
+    for stroke in drawing.strokes {
+        println!("{}: {} spline controls", stroke.ink_type, stroke.points.len());
+    }
 }
-for item in decoded.native.iter().flat_map(|n| &n.items) {
-    println!("{}: frame={:?} text={:?}", item.class_name, item.frame, item.text);
+if let FreeformTier::Decoded(native) = decoded.native {
+    for item in native.items {
+        println!("{:?}: {:?}", item.class_name, item.kind);
+    }
 }
 ```
 
@@ -55,12 +78,27 @@ The package is a single ESM module backed by WebAssembly. The wasm initializes a
 import { decodePasteboard } from 'libfreeform';
 import { readFileSync } from 'node:fs';
 
+const bytes = path => new Uint8Array(readFileSync(path));
 const decoded = decodePasteboard({
-  drawing: readFileSync('pb_dump/com_apple_drawing'),
-  crlNative: readFileSync('pb_dump/com_apple_freeform_CRLNativeData'),
-  tsuDescription: readFileSync('pb_dump/com_apple_freeform_TSUDescription'),
+  flavors: [
+    { uti: 'com.apple.drawing', bytes: bytes('pb_dump/flavor-000003.bin') },
+    {
+      uti: 'com.apple.freeform.CRLNativeData',
+      bytes: bytes('pb_dump/flavor-000001.bin'),
+    },
+    {
+      uti: 'com.apple.freeform.TSUDescription',
+      bytes: bytes('pb_dump/flavor-000002.bin'),
+    },
+  ],
 });
-console.log(decoded.drawing?.strokes.length, decoded.native?.items);
+
+if (decoded.drawing.status === 'decoded') {
+  console.log(decoded.drawing.value.strokes.length);
+}
+if (decoded.native.status === 'decoded') {
+  console.log(decoded.native.value.items);
+}
 ```
 
 - **Node ≥ 20 / Bun** — works as-is (the `node` export condition loads the wasm synchronously from disk).
@@ -74,27 +112,27 @@ Every function is fully typed (`index.d.ts` ships with the package); decoded obj
 
 | Function | Purpose |
 |---|---|
-| `decodePasteboard(blobs)` | Assemble all present flavors into one `FreeformPasteboard`; failed tiers degrade to `undefined` |
-| `decodePkDrawing(bytes)` | `com.apple.drawing` → strokes with per-point pressure/width (throws on unknown versions) |
-| `decodeCrlNative(bytes, tsu?)` | `CRLNativeData` (+ optional `TSUDescription` join) → board items with frames/fills/text |
-| `parseTsuDescription(bytes)` | `TSUDescription` → ordered `{ className, hints }` entries |
-| `classifyBlob(name, bytes)` | Route a captured file to its flavor by filename + content signature |
-| `isPkDrawing(bytes)` | Cheap `"wrd"` magic check |
-| `hasFreeformContent(blobs)` | True when a flavor that can carry content is present |
+| `decodePasteboard(snapshot)` | Decode exact ordered flavors into independent tier outcomes while retaining assets, renders, state, text, style, unknown flavors, and diagnostics |
+| `decodePkDrawing(bytes)` | Decode local PencilKit spline controls, transforms, proven point channels, ink metadata, and raw records |
+| `decodeCrlNative(bytes, tsu?)` | Decode record-bounded CRL items and optionally perform a strict TSU join |
+| `parseTsuDescription(bytes)` | Decode ordered classes and recursive typed hint values |
+| `classifyBlob(name, bytes)` | Classify exact UTIs/dump aliases and validated drawing/render signatures |
+| `isPkDrawing(bytes)` | Check the `"wrd"` signature without crossing the Wasm boundary |
+| `hasFreeformContent(snapshot)` | Test whether a snapshot contains an importable structured, asset, text/style, or rendered flavor |
 
 ## Capturing pasteboard data
 
-`pbpaste` only sees text. To capture the Freeform flavors, copy something in Freeform, then dump every flavor to disk (macOS):
+`pbpaste` only sees text. Copy something in Freeform, then capture one atomic snapshot:
 
 ```sh
-swift tools/dump_pasteboard.swift pb_dump   # -> pb_dump/<flavor_name>
+swift tools/dump_pasteboard.swift pb_dump
 ```
 
-Feed the resulting files to `decodePasteboard` / `classifyBlob` as shown above. [`docs/FORMAT.md`](docs/FORMAT.md) describes each flavor's layout and how new shape types were verified.
+The destination contains `manifest.json` plus collision-safe `flavor-NNNNNN.bin` files. The manifest preserves exact UTIs, ordering, byte counts, and the stable pasteboard `changeCount`; capture retries if the pasteboard changes and atomically replaces an older snapshot without stale conditional assets.
 
 ## Stability
 
-The `com.apple.freeform.*` formats are private and can change with any Freeform/OS update (fixtures were captured on macOS 26.x). `PKDrawing` decoding is the most stable tier; the `CRLNativeData` heuristics are verified against real multi-shape boards but should be treated as best-effort. Gate imports on the decoded result, not on assumptions about the source version — that is how the API is shaped.
+The `com.apple.freeform.*` formats are private and can change with any Freeform or OS update. CRL records are decoded only inside established object boundaries, and unknown fields remain available as raw bytes. `FreeformCompatibility` and per-tier failures let callers choose a render fallback without confusing absence, truncation, unsupported versions, or correlation failures.
 
 ## Repository layout
 
