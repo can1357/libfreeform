@@ -438,7 +438,7 @@ mod tests {
    #[test]
    fn real_fixture_decodes() {
       assert!(is_pk_drawing(FIXTURE));
-      assert!(!decode_pk_drawing(FIXTURE).unwrap().strokes.is_empty());
+      assert_ne!(decode_pk_drawing(FIXTURE).unwrap().strokes, []);
    }
    #[test]
    fn keeps_points_local_and_transform_complete() {

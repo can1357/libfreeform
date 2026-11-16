@@ -395,7 +395,8 @@ fn reconcile(manifest_ids: &[[u8; 16]], index_ids: &[String]) -> Result<(), Free
       )));
    }
    // Older captured fixtures use an all-zero UUID for every manifest reference.
-   // It is an explicit nil reference, not evidence that any index item owns data.
+   // It is an explicit nil reference, not evidence that any index item owns
+   // data.
    if manifest_ids.iter().all(|raw| *raw == NIL_UUID) {
       return Ok(());
    }

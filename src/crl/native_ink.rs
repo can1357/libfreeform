@@ -312,7 +312,8 @@ fn decode_stroke(data: &[u8]) -> Result<Option<FreeformInkStroke>, FreeformDecod
    };
    let Some(transform) = decode_transform(&fields) else {
       // `FreeformInkStroke::transform` cannot represent an unknown transform.
-      // Leaving this record to its owner's raw fallback avoids creating identity.
+      // Leaving this record to its owner's raw fallback avoids creating
+      // identity.
       return Ok(None);
    };
    let points = direct_points(&fields);
@@ -471,7 +472,7 @@ mod tests {
             .map(|color| color.color_space.as_str()),
          Some("extended-sRGB")
       );
-      assert!(strokes[1].points.is_empty());
+      assert_eq!(strokes[1].points, []);
       assert_eq!(strokes[1].raw_data, second);
    }
 }
