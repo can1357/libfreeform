@@ -16,12 +16,29 @@ function hasPrefix(bytes, prefix) {
   );
 }
 
+function dumpName(name) {
+  return typeof name === 'string'
+    ? name
+        .split(/[/\\]/)
+        .at(-1)
+        .trim()
+        .replace(/\.bin$/i, '')
+    : '';
+}
+
 function normalizedName(name) {
-  return typeof name === 'string' ? name.toLowerCase().replaceAll(/[^a-z0-9]/g, '') : '';
+  return dumpName(name)
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9]/g, '');
 }
 
 function isTiff(bytes) {
-  return hasPrefix(bytes, [0x49, 0x49, 0x2a, 0x00]) || hasPrefix(bytes, [0x4d, 0x4d, 0x00, 0x2a]);
+  return (
+    hasPrefix(bytes, [0x49, 0x49, 0x2a, 0x00]) ||
+    hasPrefix(bytes, [0x4d, 0x4d, 0x00, 0x2a]) ||
+    hasPrefix(bytes, [0x49, 0x49, 0x2b, 0x00]) ||
+    hasPrefix(bytes, [0x4d, 0x4d, 0x00, 0x2b])
+  );
 }
 
 const BYTE_FIELDS = new Set([
@@ -64,12 +81,29 @@ export function isPkDrawing(bytes) {
 /** Identify a blob from its exact captured type/name or a small signature. */
 export function classifyBlob(name, bytes) {
   const normalized = normalizedName(name);
-  if (normalized.includes('crlnativedata')) return 'crlNative';
-  if (normalized.includes('crlnativemetadata')) return 'nativeMetadata';
-  if (normalized.includes('tsudescription')) return 'tsuDescription';
-  if (normalized.includes('stylepasteboard')) return 'style';
-  if (normalized.startsWith('comapplefreeformpasteboardstate')) return 'state';
-  if (normalized.startsWith('comapplefreeformcrlasset')) return 'asset';
+  const exact = dumpName(name);
+  if (
+    /^(?:com\.apple\.freeform\.pasteboardstate\.|com_apple_freeform_pasteboardstate_).+$/i.test(
+      exact,
+    )
+  )
+    return 'state';
+  if (/^(?:com\.apple\.freeform\.crlasset\.|com_apple_freeform_crlasset_).+$/i.test(exact))
+    return 'asset';
+  if (
+    normalized === 'comapplefreeformcrlnativedata' ||
+    /^com\.apple\.freeform\.CRLNativeData\.[1-9]\d*$/i.test(exact) ||
+    /^com_apple_freeform_CRLNativeData_[1-9]\d*$/i.test(exact)
+  )
+    return 'crlNative';
+  if (
+    normalized === 'comapplefreeformcrlnativemetadata' ||
+    /^com\.apple\.freeform\.CRLNativeMetadata\.[1-9]\d*$/i.test(exact) ||
+    /^com_apple_freeform_CRLNativeMetadata_[1-9]\d*$/i.test(exact)
+  )
+    return 'nativeMetadata';
+  if (normalized === 'comapplefreeformtsudescription') return 'tsuDescription';
+  if (normalized === 'comapplefreeformstylepasteboard') return 'style';
   if (normalized === 'publicutf8plaintext') return 'plainText';
   if (normalized === 'publicrtf') return 'richText';
   if (
@@ -126,20 +160,5 @@ export function decodePasteboard(blobs) {
 /** True when a snapshot contains a flavor with importable content. */
 export function hasFreeformContent(blobs) {
   if (blobs == null || !Array.isArray(blobs.flavors)) return false;
-  return blobs.flavors.some(flavor => {
-    if (flavor == null || typeof flavor.uti !== 'string') return false;
-    const kind = classifyBlob(flavor.uti, flavor.bytes);
-    if (kind === 'drawing') return isPkDrawing(flavor.bytes);
-    return [
-      'asset',
-      'crlNative',
-      'plainText',
-      'renderPdf',
-      'renderPng',
-      'renderTiff',
-      'richText',
-      'style',
-      'tsuDescription',
-    ].includes(kind);
-  });
+  return wasm.hasFreeformContent(blobs);
 }

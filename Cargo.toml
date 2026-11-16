@@ -7,7 +7,7 @@ readme = "README.md"
 documentation = "https://docs.rs/libfreeform"
 version = "2.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/can1357/libfreeform"
 include = [
@@ -37,6 +37,7 @@ wasm = ["serde", "dep:serde-wasm-bindgen", "dep:wasm-bindgen"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
+url = { version = "2", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 serde-wasm-bindgen = { version = "0.6", optional = true }
@@ -59,6 +60,13 @@ panic = "abort"
 [package.metadata.docs.rs]
 all-features = true
 
+[lints.rust]
+# ──────────────────────────────────────────────────────────────────────────────
+# Rust Lint Levels
+# ──────────────────────────────────────────────────────────────────────────────
+mismatched_lifetime_syntaxes = "allow"
+missing_docs = "warn"                  # Every public symbol documented
+
 [lints.clippy]
 # ──────────────────────────────────────────────────────────────────────────────
 # Base Lint Levels
@@ -72,6 +80,13 @@ style = { level = "warn", priority = -1 }
 suspicious = { level = "deny", priority = -1 }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Synchronization Policy
+# ──────────────────────────────────────────────────────────────────────────────
+disallowed_macros = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Meta: Lint Attributes
 # ──────────────────────────────────────────────────────────────────────────────
 allow_attributes_without_reason = "warn" # Enforce reason for all #[allow]
@@ -79,7 +94,12 @@ allow_attributes_without_reason = "warn" # Enforce reason for all #[allow]
 # ──────────────────────────────────────────────────────────────────────────────
 # Safety & Unsafe Code
 # ──────────────────────────────────────────────────────────────────────────────
+borrow_as_ptr = "allow"
+cast_ptr_alignment = "allow"
+ptr_as_ptr = "allow"
+ref_as_ptr = "allow"
 undocumented_unsafe_blocks = "warn"
+unsafe_derive_deserialize = "allow"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Numeric Casts & Conversions
@@ -94,17 +114,18 @@ tuple_array_conversions = "allow"  # Non-Into conversion is more clear
 # ──────────────────────────────────────────────────────────────────────────────
 # Floating Point
 # ──────────────────────────────────────────────────────────────────────────────
-float_cmp = "allow"         # Tests mostly do this + we know what we're doing
-suboptimal_flops = "allow"  # mul_add changes rounding; decoders must stay bit-stable
+float_cmp = "allow"        # Tests mostly do this + we know what we're doing
+imprecise_flops = "allow"  # hypot/ln_1p trade speed for range geometry never needs
+suboptimal_flops = "allow" # a * b + c stays as written; mul_add changes rounding
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Functions & Closures
 # ──────────────────────────────────────────────────────────────────────────────
 inline_always = "allow"                      # Needed for performance-critical code
-must_use_candidate = "allow"                 # Not every function needs #[must_use]
+must_use_candidate = "allow"                 # Only lifecycle guards opt into #[must_use]
 needless_pass_by_value = "allow"
 redundant_closure_for_method_calls = "allow" # .map(ToString::to_string) can be clearer
-return_self_not_must_use = "allow"           # Builder pattern methods
+return_self_not_must_use = "allow"           # Builder chains do not require #[must_use]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Structs & Types
@@ -131,17 +152,19 @@ wildcard_imports = "allow"       # Cleaner for preludes and test modules
 # Variables & Type Inference
 # ──────────────────────────────────────────────────────────────────────────────
 let_underscore_untyped = "allow" # Type obvious from context
+many_single_char_names = "allow" # x, y, w, h, r, g, b, a are the geometry/color vocabulary
 similar_names = "allow"          # 'req' and 'res' together are fine
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Literals & Formatting
 # ──────────────────────────────────────────────────────────────────────────────
-unreadable_literal = "allow" # 10_000_000 vs 0xDEADBEEF is context dependent
-verbose_bit_mask = "allow"   # Explicit bit patterns can be clearer than hex
+unreadable_literal = "allow"   # 10_000_000 vs 0xDEADBEEF is context dependent
+verbose_bit_mask = "allow"     # Explicit bit patterns can be clearer than hex
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Code Style
 # ──────────────────────────────────────────────────────────────────────────────
+assert_is_empty = "allow"             # assert!(x.is_empty()) is fine
 default_trait_access = "allow"        # Default::default() sometimes clearer
 significant_drop_tightening = "allow" # We pay attention to this already
 
@@ -154,4 +177,5 @@ missing_panics_doc = "allow" # Not every panic needs docs, especially assert!
 # ──────────────────────────────────────────────────────────────────────────────
 # Complexity
 # ──────────────────────────────────────────────────────────────────────────────
-too_many_lines = "allow" # Arbitrary limits don't account for necessary complexity
+too_many_arguments = "allow" # Argument count is rarely the real complexity signal
+too_many_lines = "allow"     # Arbitrary limits don't account for necessary complexity

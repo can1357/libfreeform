@@ -1,403 +1,231 @@
-//! Bounded decoders for Freeform asset descriptors and media board items.
-//!
-//! CRL asset records are not self-describing enough to safely infer every
-//! archived property.  This module only promotes values whose wire shape is
-//! unambiguous and retains each bounded descriptor verbatim for the rest.
+//! Native media CRDTs and their integer-keyed `CRLAssetData` descriptors.
 
-use super::envelope::NativeRecord;
-use crate::types::{FreeformAsset, FreeformFrame, FreeformItemKind, FreeformPath, FreeformSize};
-#[derive(Clone, Copy)]
-enum Wire<'a> {
-   Varint,
-   Fixed32(u32),
-   Bytes(&'a [u8]),
-}
+use super::{
+   coherence::{Node, Value},
+   finite, invalid, shape,
+};
+use crate::types::{FreeformAsset, FreeformDecodeError, FreeformItemKind};
 
-struct Field<'a> {
-   number: u64,
-   value:  Wire<'a>,
-}
+type Result<T, E = FreeformDecodeError> = std::result::Result<T, E>;
 
-fn varint(bytes: &[u8], mut offset: usize) -> Option<(u64, usize)> {
-   let mut value = 0_u64;
-   for shift in 0..10 {
-      let byte = *bytes.get(offset)?;
-      offset += 1;
-      value |= u64::from(byte & 0x7f) << (shift * 7);
-      if byte & 0x80 == 0 {
-         return Some((value, offset));
-      }
-   }
-   None
-}
-
-fn fields(bytes: &[u8]) -> Option<Vec<Field<'_>>> {
-   let mut offset = 0;
-   let mut result = Vec::new();
-   while offset < bytes.len() {
-      let (tag, next) = varint(bytes, offset)?;
-      offset = next;
-      let number = tag >> 3;
-      if number == 0 {
-         return None;
-      }
-      let value = match tag & 7 {
-         0 => {
-            let (_, next) = varint(bytes, offset)?;
-            offset = next;
-            Wire::Varint
-         },
-         1 => {
-            bytes.get(offset..offset.checked_add(8)?)?;
-            offset += 8;
-            // Fixed64 values have no proven asset mapping.
-            continue;
-         },
-         2 => {
-            let (length, next) = varint(bytes, offset)?;
-            let length = usize::try_from(length).ok()?;
-            let end = next.checked_add(length)?;
-            let value = bytes.get(next..end)?;
-            offset = end;
-            Wire::Bytes(value)
-         },
-         5 => {
-            let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
-            offset += 4;
-            Wire::Fixed32(u32::from_le_bytes(raw))
-         },
-         _ => return None,
-      };
-      result.push(Field { number, value });
-   }
-   Some(result)
-}
-
-fn strings(bytes: &[u8], output: &mut Vec<String>, depth: usize) {
-   if depth == 8 {
-      return;
-   }
-   let Some(message) = fields(bytes) else {
-      return;
+/// `CRLAssetData.encode(to:)` (0x101208a70): identity is key 0, filename
+/// key 1, media-library UUID key 2, and may-need-watermark key 3. In
+/// particular the media-library UUID and the owning item's UUID are not asset
+/// IDs.
+fn asset(value: Value<'_>) -> Result<Option<FreeformAsset>> {
+   let Some(value) = value.optional()? else {
+      return Ok(None);
    };
-   for field in message {
-      let Wire::Bytes(value) = field.value else {
-         continue;
-      };
-      if let Ok(text) = std::str::from_utf8(value)
-         && !text.is_empty()
-         && !text.chars().any(char::is_control)
-      {
-         output.push(text.to_owned());
-      }
-      strings(value, output, depth + 1);
+   let Some(id) = value.field(0)?.map(Value::uuid).transpose()?.flatten() else {
+      return Ok(None);
+   };
+   let filename = value
+      .field(1)?
+      .map(Value::string)
+      .transpose()?
+      .flatten()
+      .map(str::to_owned);
+   let premium = value
+      .field(3)?
+      .map(Value::optional)
+      .transpose()?
+      .flatten()
+      .map(Value::boolean)
+      .transpose()?
+      .flatten();
+   Ok(Some(FreeformAsset {
+      id,
+      filename,
+      uti: None,
+      bytes: None,
+      premium,
+      intrinsic_size: None,
+      raw_descriptor: value.bytes.to_vec(),
+   }))
+}
+
+fn append_asset(
+   values: Option<Value<'_>>,
+   key: u64,
+   assets: &mut Vec<FreeformAsset>,
+) -> Result<Option<String>> {
+   let Some(value) = values.map(|value| value.field(key)).transpose()?.flatten() else {
+      return Ok(None);
+   };
+   let Some(asset) = asset(value)? else {
+      return Ok(None);
+   };
+   let id = asset.id.clone();
+   if !assets.iter().any(|existing| existing.id == id) {
+      assets.push(asset);
    }
+   Ok(Some(id))
 }
 
-fn filename(strings: &[String]) -> Option<String> {
-   strings.iter().find_map(|value| {
-      let name = value.rsplit(['/', '\\']).next()?;
-      let (_, extension) = name.rsplit_once('.')?;
-      (!name.is_empty() && !extension.is_empty()).then(|| name.to_owned())
-   })
-}
-
-fn extension(filename: &str) -> Option<&str> {
-   let (_, extension) = filename.rsplit_once('.')?;
-   (!extension.is_empty()).then_some(extension)
-}
-
-fn media_extension(extension: &str) -> bool {
-   matches!(
-      extension.to_ascii_lowercase().as_str(),
-      "mov" | "mp4" | "m4v" | "avi" | "mkv" | "webm" | "mp3" | "m4a" | "wav" | "aiff"
-   )
-}
-
-fn image_extension(extension: &str) -> bool {
-   matches!(
-      extension.to_ascii_lowercase().as_str(),
-      "jpg" | "jpeg" | "png" | "heic" | "heif" | "gif" | "webp" | "tif" | "tiff" | "bmp"
-   )
-}
-
-fn usdz_extension(extension: &str) -> bool {
-   extension.eq_ignore_ascii_case("usdz")
-}
-
-fn frame(message: &[u8]) -> Option<FreeformFrame> {
-   let fields = fields(message)?;
-   if fields.len() != 4
-      || !fields
-         .iter()
-         .enumerate()
-         .all(|(index, field)| field.number == index as u64 + 1)
-   {
-      return None;
+/// `CRL3DRotation.rawValue` stores SIMD quaternion x/y/z/w as four big-endian
+/// float32 values (0x100f9af30), separate from the item's full 3D transform.
+fn rotation(value: Value<'_>) -> Result<Option<[f64; 4]>> {
+   let Some(bytes) = value.data()? else {
+      return Ok(None);
+   };
+   let raw = bytes
+      .as_array::<16>()
+      .ok_or_else(|| invalid("invalid USDZ quaternion length"))?;
+   let mut q = [0.0; 4];
+   for (component, bytes) in q.iter_mut().zip(raw.as_chunks::<4>().0) {
+      *component = finite(f64::from(f32::from_be_bytes(*bytes)))?;
    }
-   let mut values = [0.0; 4];
-   for (index, field) in fields.iter().enumerate() {
-      let Wire::Fixed32(bits) = field.value else {
-         return None;
-      };
-      let value = f64::from(f32::from_bits(bits));
-      if !value.is_finite() {
-         return None;
+   Ok(Some(q))
+}
+
+/// `CRL3DTransform` encoder 0x100a88ffc stores four SIMD4<Float> columns,
+/// each an unkeyed Coherence value collection, under integer keys 0 through 3.
+fn transform(value: Value<'_>) -> Result<Option<Vec<f64>>> {
+   let Some(value) = value.optional()? else {
+      return Ok(None);
+   };
+   let mut matrix = Vec::with_capacity(16);
+   for key in 0..4 {
+      let column = value
+         .field(key)?
+         .ok_or_else(|| invalid("missing spatial transform column"))?;
+      let start = matrix.len();
+      for component in column.elements()? {
+         matrix.push(
+            component?
+               .number()?
+               .ok_or_else(|| invalid("non-numeric spatial transform component"))?,
+         );
       }
-      values[index] = value;
+      if matrix.len() - start != 4 {
+         return Err(invalid("spatial transform column is not SIMD4"));
+      }
    }
-   // A crop frame has no archived rotation channel; zero is its defined
-   // coordinate-system rotation, not an inferred item rotation.
-   Some(FreeformFrame {
-      x:        values[0],
-      y:        values[1],
-      w:        values[2],
-      h:        values[3],
-      rotation: 0.0,
-   })
+   Ok(Some(matrix))
 }
 
-fn intrinsic_size(bytes: &[u8]) -> Option<FreeformSize> {
-   let message = fields(bytes)?;
-   message.into_iter().find_map(|field| {
-      let Wire::Bytes(nested) = field.value else {
-         return None;
-      };
-      let values = fields(nested)?;
-      if values.len() != 2 || values[0].number != 1 || values[1].number != 2 {
-         return None;
-      }
-      let (Wire::Fixed32(width), Wire::Fixed32(height)) = (values[0].value, values[1].value) else {
-         return None;
-      };
-      let (width, height) = (f64::from(f32::from_bits(width)), f64::from(f32::from_bits(height)));
-      (width.is_finite() && height.is_finite() && width >= 0.0 && height >= 0.0)
-         .then_some(FreeformSize { width, height })
-   })
-}
-
-fn crop(bytes: &[u8]) -> Option<FreeformFrame> {
-   fields(bytes)?
-      .into_iter()
-      .find_map(|field| match field.value {
-         Wire::Bytes(nested) => frame(nested),
-         Wire::Varint | Wire::Fixed32(_) => None,
-      })
-}
-
-fn mask(bytes: &[u8], crop: Option<FreeformFrame>) -> Option<FreeformPath> {
-   let crop_seen = crop.is_some();
-   fields(bytes)?.into_iter().find_map(|field| {
-      let Wire::Bytes(nested) = field.value else {
-         return None;
-      };
-      if crop_seen && frame(nested).is_none() && fields(nested).is_some() {
-         Some(FreeformPath {
-            commands:     Vec::new(),
-            natural_size: None,
-            raw_data:     nested.to_vec(),
-         })
-      } else {
-         None
-      }
-   })
-}
-
-fn spatial_transform(bytes: &[u8]) -> Option<Vec<f64>> {
-   fields(bytes)?.into_iter().find_map(|field| {
-      let Wire::Bytes(nested) = field.value else {
-         return None;
-      };
-      let values = fields(nested)?;
-      if values.len() != 16
-         || !values
-            .iter()
-            .enumerate()
-            .all(|(index, field)| field.number == index as u64 + 1)
-      {
-         return None;
-      }
-      values
-         .into_iter()
-         .map(|field| match field.value {
-            Wire::Fixed32(bits) => {
-               let value = f64::from(f32::from_bits(bits));
-               value.is_finite().then_some(value)
-            },
-            Wire::Varint | Wire::Bytes(_) => None,
-         })
-         .collect()
-   })
-}
-
-fn url(strings: &[String]) -> Option<String> {
-   strings
-      .iter()
-      .find(|value| value.starts_with("https://") || value.starts_with("http://"))
-      .cloned()
-}
-
-/// Decodes one bounded native asset descriptor without inspecting neighbouring
-/// records.
-///
-/// The descriptor's owner UUID is authoritative.  Unrecognised descriptor
-/// fields remain in [`FreeformAsset::raw_descriptor`], including malformed
-/// protobuf data.
-pub fn decode_asset(record: &NativeRecord<'_>) -> FreeformAsset {
-   let mut values = Vec::new();
-   strings(record.bytes, &mut values, 0);
-   FreeformAsset {
-      id:             record.owner_id.clone(),
-      filename:       filename(&values),
-      uti:            None,
-      bytes:          None,
-      premium:        values
-         .iter()
-         .any(|value| value.eq_ignore_ascii_case("premium"))
-         .then_some(true),
-      intrinsic_size: intrinsic_size(record.bytes),
-      raw_descriptor: record.bytes.to_vec(),
-   }
-}
-
-/// Decodes a bounded image, media, file, URL, or USDZ record.
-///
-/// The decoder classifies only concrete URL schemes and filename extensions.
-/// It returns [`FreeformItemKind::Unknown`] for records without a proven item
-/// payload.
-pub fn decode_media(record: &NativeRecord<'_>) -> FreeformItemKind {
-   let mut values = Vec::new();
-   strings(record.bytes, &mut values, 0);
-   if let Some(url) = url(&values) {
-      let title = values
-         .into_iter()
-         .find(|value| value != &url && filename(std::slice::from_ref(value)).is_none());
-      return FreeformItemKind::Url { url: Some(url), title };
-   }
-   let name = filename(&values);
-   if let Some(name) = name.as_deref()
-      && let Some(extension) = extension(name)
-   {
-      if usdz_extension(extension) {
-         return FreeformItemKind::Usdz {
-            asset_id:          Some(record.owner_id.clone()),
-            spatial_transform: spatial_transform(record.bytes),
-         };
-      }
-      if media_extension(extension) {
-         return FreeformItemKind::Media {
-            asset_id:   Some(record.owner_id.clone()),
-            media_type: Some(extension.to_ascii_lowercase()),
-         };
-      }
-      if image_extension(extension) {
-         let crop = crop(record.bytes);
-         return FreeformItemKind::Image {
-            asset_id: Some(record.owner_id.clone()),
-            mask: mask(record.bytes, crop),
-            crop,
-         };
-      }
-      return FreeformItemKind::File {
-         asset_id: Some(record.owner_id.clone()),
-         filename: Some(name.to_owned()),
-      };
-   }
-   if let Some(crop) = crop(record.bytes) {
-      return FreeformItemKind::Image {
-         asset_id: Some(record.owner_id.clone()),
-         mask:     mask(record.bytes, Some(crop)),
-         crop:     Some(crop),
-      };
-   }
-   FreeformItemKind::Unknown
+/// Classifies by the native persistence discriminator, never by a filename or
+/// strings found in unrelated nested records. Auxiliary assets retain their own
+/// IDs.
+pub fn decode_media(
+   common: Node<'_>,
+   specific: Node<'_>,
+   persistence_type: u32,
+) -> Result<(FreeformItemKind, Vec<FreeformAsset>)> {
+   let values = specific.property("a")?;
+   let mut assets = Vec::new();
+   let asset_id = append_asset(values, 0, &mut assets)?;
+   let kind = match persistence_type {
+      5 => {
+         append_asset(values, 1, &mut assets)?;
+         let mask_data = specific.property("c")?;
+         let mask = mask_data
+            .map(|value| value.field(0))
+            .transpose()?
+            .flatten()
+            .map(shape::path)
+            .transpose()?
+            .flatten();
+         let crop = mask_data
+            .map(|value| value.field(1))
+            .transpose()?
+            .flatten()
+            .map(shape::geometry)
+            .transpose()?
+            .and_then(|geometry| geometry.frame);
+         FreeformItemKind::Image { asset_id, crop, mask }
+      },
+      6 => {
+         append_asset(values, 1, &mut assets)?;
+         let audio_only = values
+            .map(|value| value.field(5))
+            .transpose()?
+            .flatten()
+            .map(Value::boolean)
+            .transpose()?
+            .flatten();
+         FreeformItemKind::Media {
+            asset_id,
+            media_type: audio_only.map(|audio| if audio { "audio" } else { "movie" }.to_owned()),
+         }
+      },
+      7 => {
+         append_asset(values, 1, &mut assets)?;
+         let filename = assets.first().and_then(|asset| asset.filename.clone());
+         FreeformItemKind::File { asset_id, filename }
+      },
+      8 => {
+         let url = values
+            .map(|value| value.field(1))
+            .transpose()?
+            .flatten()
+            .map(Value::url)
+            .transpose()?
+            .flatten();
+         FreeformItemKind::Url { url, title: None }
+      },
+      9 => {
+         append_asset(values, 1, &mut assets)?;
+         let orientation = values
+            .map(|value| value.field(2))
+            .transpose()?
+            .flatten()
+            .map(rotation)
+            .transpose()?
+            .flatten();
+         let spatial_transform = common
+            .property("b")?
+            .map(|value| value.field(2))
+            .transpose()?
+            .flatten()
+            .map(transform)
+            .transpose()?
+            .flatten();
+         FreeformItemKind::Usdz { asset_id, spatial_transform, orientation }
+      },
+      _ => FreeformItemKind::Unknown,
+   };
+   Ok((kind, assets))
 }
 
 #[cfg(test)]
 mod tests {
    use super::*;
-
-   fn encoded_string(value: &str) -> Vec<u8> {
-      let mut bytes = vec![0x0a, value.len() as u8];
-      bytes.extend_from_slice(value.as_bytes());
-      bytes
-   }
-
-   fn encoded_bytes(field: u8, value: &[u8]) -> Vec<u8> {
-      let mut bytes = vec![field << 3 | 2, value.len() as u8];
-      bytes.extend_from_slice(value);
-      bytes
-   }
-
-   fn fixed32(field: u8, value: f32) -> Vec<u8> {
-      let mut bytes = vec![field << 3 | 5];
-      bytes.extend_from_slice(&value.to_bits().to_le_bytes());
-      bytes
-   }
-
-   fn record<'a>(id: &str, bytes: &'a [u8]) -> NativeRecord<'a> {
-      NativeRecord { owner_id: id.to_owned(), offset: 0, bytes }
-   }
+   use crate::crl::{coherence::Document, envelope::parse_native_archive};
 
    #[test]
-   fn decodes_embedded_image_crop_and_raw_mask() {
-      let mut crop = Vec::new();
-      for (field, value) in [(1, 1.0), (2, 2.0), (3, 30.0), (4, 40.0)] {
-         crop.extend(fixed32(field, value));
-      }
-      let mut bytes = encoded_string("photo.png");
-      bytes.extend(encoded_bytes(2, &crop));
-      bytes.extend(encoded_bytes(3, &[0x08, 0x01]));
-
-      let item = decode_media(&record("A", &bytes));
-      let FreeformItemKind::Image { asset_id, crop, mask } = item else {
+   fn captured_premium_image_uses_asset_identity_and_native_mask() {
+      let archive =
+         parse_native_archive(include_bytes!("../../fixtures/real-board.crlnative")).unwrap();
+      let image = archive
+         .objects
+         .iter()
+         .find(|object| object.persistence_type == 5)
+         .unwrap();
+      let common = Document::parse(image.region("commonCRDTData").unwrap().bytes)
+         .unwrap()
+         .root()
+         .unwrap()
+         .unwrap();
+      let specific = Document::parse(image.region("specificCRDTData").unwrap().bytes)
+         .unwrap()
+         .root()
+         .unwrap()
+         .unwrap();
+      let (kind, assets) = decode_media(common, specific, 5).unwrap();
+      assert_eq!(assets.len(), 1);
+      assert_eq!(assets[0].id, "EC3BE892-0B72-5127-9352-B3304685DF29");
+      assert_ne!(assets[0].id, image.id);
+      assert_eq!(assets[0].filename.as_deref(), Some("2F9A0393-9103-584B-A2CA-F9B0AE4BD4AB.jpg"));
+      assert_eq!(assets[0].premium, Some(true));
+      assert!(assets[0].bytes.is_none());
+      let FreeformItemKind::Image { asset_id, crop, mask } = kind else {
          panic!("expected image");
       };
-      assert_eq!(asset_id.as_deref(), Some("A"));
-      assert_eq!(crop.unwrap().w, 30.0);
-      assert_eq!(mask.unwrap().raw_data, vec![0x08, 0x01]);
-   }
-
-   #[test]
-   fn premium_descriptor_without_bytes_retains_descriptor() {
-      let bytes = encoded_string("premium");
-      let asset = decode_asset(&record("P", &bytes));
-      assert_eq!(asset.id, "P");
-      assert_eq!(asset.premium, Some(true));
-      assert_eq!(asset.bytes, None);
-      assert_eq!(asset.raw_descriptor, bytes);
-   }
-
-   #[test]
-   fn decodes_movie_file_url_and_usdz() {
-      let movie = decode_media(&record("M", &encoded_string("clip.mov")));
-      assert_eq!(movie, FreeformItemKind::Media {
-         asset_id:   Some("M".into()),
-         media_type: Some("mov".into()),
-      });
-      let file = decode_media(&record("F", &encoded_string("notes.unknownext")));
-      assert_eq!(file, FreeformItemKind::File {
-         asset_id: Some("F".into()),
-         filename: Some("notes.unknownext".into()),
-      });
-      let mut url = encoded_string("https://example.test/page");
-      url.extend(encoded_bytes(2, b"Example"));
-      assert_eq!(decode_media(&record("U", &url)), FreeformItemKind::Url {
-         url:   Some("https://example.test/page".into()),
-         title: Some("Example".into()),
-      });
-      let usdz = decode_media(&record("S", &encoded_string("model.usdz")));
-      assert_eq!(usdz, FreeformItemKind::Usdz {
-         asset_id:          Some("S".into()),
-         spatial_transform: None,
-      });
-   }
-
-   #[test]
-   fn malformed_descriptor_is_a_non_lossy_unknown_fallback() {
-      let raw = [0x0a, 0x05, b'x'];
-      let asset = decode_asset(&record("X", &raw));
-      assert_eq!(asset.raw_descriptor, raw);
-      assert_eq!(decode_media(&record("X", &raw)), FreeformItemKind::Unknown);
+      assert_eq!(asset_id.as_deref(), Some(assets[0].id.as_str()));
+      let crop = crop.unwrap();
+      assert_eq!((crop.x, crop.y, crop.w, crop.h), (0.0, 0.0, 250.0, 187.5));
+      assert!(matches!(mask.unwrap().source,
+         Some(crate::types::FreeformPathSource::Scalar { name, scalar, .. }) if name == "roundedRectangle" && scalar == 10.0));
    }
 }

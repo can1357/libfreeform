@@ -14,7 +14,6 @@ const fixture = name =>
 
 const count = runChecks(api, {
   inkPen: fixture('ink-pen.drawing'),
-  nativeMixed: fixture('native-mixed.crlnative'),
   tsuDescription: fixture('native-mixed.tsudescription'),
   realBoardNative: fixture('real-board.crlnative'),
   realBoardTsu: fixture('real-board.tsudescription'),

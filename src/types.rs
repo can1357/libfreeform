@@ -106,7 +106,42 @@ pub struct FreeformGeometry {
    pub height_valid:    Option<bool>,
 }
 
-/// A color with its source color-space name and normalized sRGB channels.
+/// Native color components, without lossy conversion between color models.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+   feature = "serde",
+   derive(serde::Serialize, serde::Deserialize),
+   serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")
+)]
+pub enum FreeformColorComponents {
+   /// Three channels in the declared RGB color space.
+   Rgb {
+      /// Red channel in the declared RGB space.
+      red:   f64,
+      /// Green channel in the declared RGB space.
+      green: f64,
+      /// Blue channel in the declared RGB space.
+      blue:  f64,
+   },
+   /// Device CMYK channels requiring a color profile for RGB conversion.
+   Cmyk {
+      /// Native cyan component.
+      cyan:    f64,
+      /// Native magenta component.
+      magenta: f64,
+      /// Native yellow component.
+      yellow:  f64,
+      /// Native black component.
+      black:   f64,
+   },
+   /// One white channel in the declared monochrome space.
+   Monochrome {
+      /// Native monochrome white component.
+      white: f64,
+   },
+}
+
+/// A source-space color with an optional exact sRGB convenience representation.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(
    feature = "serde",
@@ -116,32 +151,12 @@ pub struct FreeformGeometry {
 pub struct FreeformColor {
    /// Source color-space identifier.
    pub color_space: String,
-   /// Normalized sRGB red channel.
-   pub red:         f64,
-   /// Normalized sRGB green channel.
-   pub green:       f64,
-   /// Normalized sRGB blue channel.
-   pub blue:        f64,
+   /// Components in the archived color model and color space.
+   pub components:  FreeformColorComponents,
    /// Alpha channel.
    pub alpha:       f64,
-   /// Rounded CSS representation retained for convenient consumers.
-   pub hex:         String,
-}
-
-/// One stop in a native gradient fill.
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-   feature = "serde",
-   derive(serde::Serialize, serde::Deserialize),
-   serde(rename_all = "camelCase")
-)]
-pub struct FreeformGradientStop {
-   /// Position along the gradient from zero to one.
-   pub fraction:   f64,
-   /// Native midpoint/inflection value.
-   pub inflection: Option<f64>,
-   /// Stop color.
-   pub color:      FreeformColor,
+   /// Rounded CSS RGB value when conversion to sRGB is established.
+   pub hex:         Option<String>,
 }
 
 /// A native fill or stroke paint.
@@ -153,34 +168,31 @@ pub struct FreeformGradientStop {
 )]
 pub enum FreeformPaint {
    /// A solid color.
-   Solid { color: FreeformColor },
-   /// A linear gradient.
-   LinearGradient {
-      /// Gradient start in local coordinates.
-      start: FreeformPoint,
-      /// Gradient end in local coordinates.
-      end:   FreeformPoint,
-      /// Ordered color stops.
-      stops: Vec<FreeformGradientStop>,
-   },
-   /// A radial gradient.
-   RadialGradient {
-      /// Gradient center in local coordinates.
-      center: FreeformPoint,
-      /// Gradient radius.
-      radius: f64,
-      /// Ordered color stops.
-      stops:  Vec<FreeformGradientStop>,
-   },
-   /// An image-backed fill.
-   Image {
-      /// Referenced asset identifier.
-      asset_id:  String,
-      /// Native scaling technique when known.
-      technique: Option<String>,
+   Solid {
+      /// Color and alpha in their source space.
+      color: FreeformColor,
    },
    /// An unsupported paint whose archive bytes remain available.
-   Unknown { raw_data: Vec<u8> },
+   Unknown {
+      /// Original unsupported paint payload.
+      raw_data: Vec<u8>,
+   },
+}
+
+/// Native `PencilKit` brush configuration attached to a geometric stroke.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+   feature = "serde",
+   derive(serde::Serialize, serde::Deserialize),
+   serde(rename_all = "camelCase")
+)]
+pub struct FreeformPencilKitStrokeStyle {
+   /// Exact native ink identifier.
+   pub ink_type:        String,
+   /// Native brush width.
+   pub width:           f64,
+   /// Explicit fountain-pen implementation selector, when archived.
+   pub fountain_pen_v2: Option<bool>,
 }
 
 /// Stroke styling for shapes and connectors.
@@ -192,23 +204,29 @@ pub enum FreeformPaint {
 )]
 pub struct FreeformStrokeStyle {
    /// Stroke paint.
-   pub paint:       FreeformPaint,
+   pub paint:                   FreeformPaint,
    /// Stroke width in local points.
-   pub width:       f64,
-   /// Dash lengths in local points.
-   pub dash:        Vec<f64>,
-   /// Dash phase.
-   pub dash_offset: Option<f64>,
+   pub width:                   f64,
+   /// Native dash lengths as factors of the rendered stroke width.
+   pub dash:                    Vec<f64>,
+   /// Native dash phase as a factor of the rendered stroke width.
+   pub dash_offset:             Option<f64>,
+   /// Brush-pattern offset, distinct from dash phase.
+   pub pattern_offset_distance: Option<f64>,
+   /// Native smart-stroke brush family.
+   pub smart_stroke:            Option<String>,
+   /// `PencilKit` brush configuration when the stroke uses one.
+   pub pencil_kit:              Option<FreeformPencilKitStrokeStyle>,
    /// Native cap name.
-   pub cap:         Option<String>,
+   pub cap:                     Option<String>,
    /// Native join name.
-   pub join:        Option<String>,
+   pub join:                    Option<String>,
    /// Miter limit.
-   pub miter_limit: Option<f64>,
+   pub miter_limit:             Option<f64>,
    /// Tail decoration.
-   pub tail_end:    Option<String>,
+   pub tail_end:                Option<String>,
    /// Head decoration.
-   pub head_end:    Option<String>,
+   pub head_end:                Option<String>,
 }
 
 /// One native shadow effect.
@@ -233,6 +251,8 @@ pub struct FreeformShadow {
    pub opacity:  Option<f64>,
    /// Native angle when present.
    pub angle:    Option<f64>,
+   /// Native curvature parameter for curved shadows.
+   pub curve:    Option<f64>,
 }
 
 /// Shared visual styling for a native board item.
@@ -297,6 +317,8 @@ pub struct FreeformInkPoint {
    pub secondary_scale: Option<f64>,
    /// Versioned clipping threshold.
    pub threshold:       Option<f64>,
+   /// Native edge-width channel in local points.
+   pub edge_width:      Option<f64>,
 }
 
 /// A visible interval of a masked `PencilKit` path.
@@ -309,7 +331,7 @@ pub struct FreeformInkPoint {
 pub struct FreeformInkRange {
    /// Inclusive parametric start.
    pub start: f64,
-   /// Exclusive parametric end.
+   /// Inclusive parametric end.
    pub end:   f64,
 }
 
@@ -335,9 +357,13 @@ pub struct FreeformInkStroke {
    pub points:         Vec<FreeformInkPoint>,
    /// Visible path intervals after applying a `PencilKit` mask.
    pub visible_ranges: Option<Vec<FreeformInkRange>>,
+   /// Native clipping path in stroke-local coordinates; `PencilKit` stores
+   /// closed polygons.
+   pub mask:           Option<FreeformPath>,
    /// Seed used by randomized ink textures.
    pub random_seed:    Option<u32>,
-   /// Original stroke record for unsupported channels or future replay.
+   /// Original stroke record for unsupported channels or future replay;
+   /// strokes erased from one record share it.
    pub raw_data:       Vec<u8>,
 }
 
@@ -366,11 +392,22 @@ pub struct FreeformDrawing {
 )]
 pub enum FreeformPathCommand {
    /// Starts a new subpath.
-   Move { point: FreeformPoint },
+   Move {
+      /// Local endpoint or native control position.
+      point: FreeformPoint,
+   },
    /// Adds a straight segment.
-   Line { point: FreeformPoint },
+   Line {
+      /// Local endpoint or native control position.
+      point: FreeformPoint,
+   },
    /// Adds a quadratic Bézier segment.
-   Quadratic { control: FreeformPoint, point: FreeformPoint },
+   Quadratic {
+      /// Local quadratic control point.
+      control: FreeformPoint,
+      /// Local endpoint or native control position.
+      point:   FreeformPoint,
+   },
    /// Adds a cubic Bézier segment.
    Cubic {
       /// First control point.
@@ -384,6 +421,46 @@ pub enum FreeformPathCommand {
    Close,
 }
 
+/// Parameters for native paths that are generated rather than stored as Bézier
+/// commands.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+   feature = "serde",
+   derive(serde::Serialize, serde::Deserialize),
+   serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")
+)]
+pub enum FreeformPathSource {
+   /// Point-controlled native path.
+   Point {
+      /// Native parametric path identifier.
+      name:  String,
+      /// Local endpoint or native control position.
+      point: FreeformPoint,
+   },
+   /// Scalar-controlled native path.
+   Scalar {
+      /// Native parametric path identifier.
+      name:             String,
+      /// Archived path-control parameter.
+      scalar:           f64,
+      /// Whether the native curve uses continuous curvature.
+      curve_continuous: bool,
+      /// Whether the native path exposes its adjustment knob.
+      show_knob:        bool,
+   },
+   /// Speech-callout path with its exact native controls.
+   Callout {
+      /// Callout tail position in local coordinates.
+      tail_position: FreeformPoint,
+      /// Native callout tail-size parameter.
+      tail_size:     f64,
+      /// Native callout corner radius.
+      corner_radius: f64,
+      /// Whether the tail is centered on its attachment.
+      center_tail:   bool,
+   },
+}
+
 /// An ordered local shape path with explicit subpaths and curves.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(
@@ -393,11 +470,17 @@ pub enum FreeformPathCommand {
 )]
 pub struct FreeformPath {
    /// Path commands in archive order.
-   pub commands:     Vec<FreeformPathCommand>,
+   pub commands:        Vec<FreeformPathCommand>,
    /// Natural source size used to scale preset paths.
-   pub natural_size: Option<FreeformSize>,
+   pub natural_size:    Option<FreeformSize>,
+   /// Native parameters when no explicit Bézier command list is stored.
+   pub source:          Option<FreeformPathSource>,
+   /// Path-local flips, distinct from the containing item's geometry flips.
+   pub horizontal_flip: Option<bool>,
+   /// Path-local vertical flip.
+   pub vertical_flip:   Option<bool>,
    /// Original path payload.
-   pub raw_data:     Vec<u8>,
+   pub raw_data:        Vec<u8>,
 }
 
 /// Recursive value retained from a `TSUDescription` routing hint.
@@ -474,6 +557,10 @@ pub struct FreeformTextRun {
    pub hyperlink:           Option<String>,
    /// Native list-style name.
    pub list_style:          Option<String>,
+   /// Explicit starting number for a numbered list.
+   pub list_start:          Option<i64>,
+   /// Native paragraph/list nesting level.
+   pub paragraph_level:     Option<i64>,
 }
 
 /// Native text with preserved style runs.
@@ -488,8 +575,8 @@ pub struct FreeformText {
    pub plain:              String,
    /// Character and paragraph style runs.
    pub runs:               Vec<FreeformTextRun>,
-   /// Text inset in local points.
-   pub inset:              Option<FreeformFrame>,
+   /// Uniform text inset in local points.
+   pub inset:              Option<f64>,
    /// Native vertical-alignment name.
    pub vertical_alignment: Option<String>,
    /// Whether the container shrinks text to fit.
@@ -566,6 +653,24 @@ pub struct FreeformAsset {
    pub raw_descriptor: Vec<u8>,
 }
 
+/// Native table rendering and layout flags, independent of per-cell paint.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(
+   feature = "serde",
+   derive(serde::Serialize, serde::Deserialize),
+   serde(rename_all = "camelCase")
+)]
+pub struct FreeformTableOptions {
+   /// Archived border-option bit set.
+   pub border_options:  Option<i64>,
+   /// Whether the native table has rounded outer corners.
+   pub rounded_corners: Option<bool>,
+   /// Whether cells grow automatically with their contents.
+   pub cell_autogrow:   Option<bool>,
+   /// Whether the native table is laid out right-to-left.
+   pub right_to_left:   Option<bool>,
+}
+
 /// Item-specific native payload.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(
@@ -575,11 +680,24 @@ pub struct FreeformAsset {
 )]
 pub enum FreeformItemKind {
    /// A geometric or library shape.
-   Shape { preset: Option<String>, path: Option<FreeformPath> },
+   Shape {
+      /// Native shape-library preset identifier.
+      preset: Option<String>,
+      /// Explicit local path when stored in the archive.
+      path:   Option<FreeformPath>,
+      /// Styled label carried by a word-processing shape.
+      text:   Option<FreeformText>,
+   },
    /// A standalone text box.
-   TextBox { text: Option<FreeformText> },
+   TextBox {
+      /// Decoded content and style runs, when available.
+      text: Option<FreeformText>,
+   },
    /// A sticky note.
-   StickyNote { text: Option<FreeformText> },
+   StickyNote {
+      /// Decoded content and style runs, when available.
+      text: Option<FreeformText>,
+   },
    /// A connector or arrow.
    Connector {
       /// Tail endpoint.
@@ -599,6 +717,8 @@ pub enum FreeformItemKind {
       column_widths: Vec<f64>,
       /// Cells in archive order.
       cells:         Vec<FreeformTableCell>,
+      /// Native table-wide rendering and layout flags.
+      options:       FreeformTableOptions,
    },
    /// An image item.
    Image {
@@ -610,13 +730,35 @@ pub enum FreeformItemKind {
       mask:     Option<FreeformPath>,
    },
    /// A movie or other media item.
-   Media { asset_id: Option<String>, media_type: Option<String> },
+   Media {
+      /// Identifier used to resolve captured asset bytes.
+      asset_id:   Option<String>,
+      /// Archived media type, when available.
+      media_type: Option<String>,
+   },
    /// A file attachment.
-   File { asset_id: Option<String>, filename: Option<String> },
+   File {
+      /// Identifier used to resolve captured asset bytes.
+      asset_id: Option<String>,
+      /// Original attachment filename.
+      filename: Option<String>,
+   },
    /// A URL/link-preview item.
-   Url { url: Option<String>, title: Option<String> },
+   Url {
+      /// Resolved link target.
+      url:   Option<String>,
+      /// Archived link-preview title.
+      title: Option<String>,
+   },
    /// A USDZ spatial item.
-   Usdz { asset_id: Option<String>, spatial_transform: Option<Vec<f64>> },
+   Usdz {
+      /// Referenced USDZ asset identifier.
+      asset_id:          Option<String>,
+      /// Column-major native 4×4 placement matrix.
+      spatial_transform: Option<Vec<f64>>,
+      /// Native model orientation quaternion in x, y, z, w order.
+      orientation:       Option<[f64; 4]>,
+   },
    /// A group container.
    Group {
       /// Child UUIDs in group-local z-order.
@@ -625,24 +767,43 @@ pub enum FreeformItemKind {
       counter_transform: Option<FreeformTransform>,
    },
    /// Native freehand ink used only when `PKDrawing` is unavailable.
-   Ink { strokes: Vec<FreeformInkStroke> },
+   Ink {
+      /// Ordered native strokes in local coordinates.
+      strokes: Vec<FreeformInkStroke>,
+   },
    /// An unsupported item whose payload remains available.
    Unknown,
 }
 
-/// Byte range of one structurally owned record in
-/// `FreeformNative::raw_archive`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Named payload range in [`FreeformNative::raw_archive`], including its format
+/// header.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
    feature = "serde",
    derive(serde::Serialize, serde::Deserialize),
    serde(rename_all = "camelCase")
 )]
 pub struct FreeformRecordRange {
+   /// Exact native data-directory key.
+   pub name:   String,
    /// Offset from the beginning of the native object archive.
    pub offset: usize,
    /// Record payload length.
    pub length: usize,
+}
+
+/// A child item's cell-relative placement within its parent table.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(
+   feature = "serde",
+   derive(serde::Serialize, serde::Deserialize),
+   serde(rename_all = "camelCase")
+)]
+pub struct FreeformTableAnchor {
+   /// Stable row UUID and column UUID separated by `/`.
+   pub cell_id:  String,
+   /// Native geometry relative to the containing cell.
+   pub geometry: FreeformGeometry,
 }
 
 /// One entry of the native object graph's ordered board-item list.
@@ -654,27 +815,32 @@ pub struct FreeformRecordRange {
 )]
 pub struct FreeformBoardItem {
    /// Position in the paste's top-level item order.
-   pub index:         usize,
+   pub index:               usize,
    /// Item UUID from the typed native index.
-   pub uuid:          String,
-   /// Parent group UUID for nested items.
-   pub parent_id:     Option<String>,
-   /// Class from `TSUDescription` when safely correlated.
-   pub class_name:    Option<String>,
+   pub uuid:                String,
+   /// Parent group, table, or ink-container UUID for nested items.
+   pub parent_id:           Option<String>,
+   /// Cell-relative placement when the parent is a table.
+   pub table_anchor:        Option<FreeformTableAnchor>,
+   /// Native persistence discriminator, retained for newer item kinds.
+   pub persistence_type:    u32,
+   /// Native persistence subtype when present.
+   pub persistence_subtype: Option<u32>,
+   /// Class established by the native discriminator or a correlated TSU entry.
+   pub class_name:          Option<String>,
    /// Structured TSU routing hints.
-   pub hints:         BTreeMap<String, TsuValue>,
+   pub hints:               BTreeMap<String, TsuValue>,
    /// Item geometry.
-   pub geometry:      FreeformGeometry,
+   pub geometry:            FreeformGeometry,
    /// Item style.
-   pub style:         FreeformStyle,
+   pub style:               FreeformStyle,
    /// Item-specific payload.
-   pub kind:          FreeformItemKind,
-   /// Exact bounded owner-record ranges in archive order.
-   pub record_ranges: Vec<FreeformRecordRange>,
-   /// Primary common-record bytes retained for unsupported fields.
-   ///
-   /// See [`FreeformBoardItem::record_ranges`] for every owned record.
-   pub raw_data:      Vec<u8>,
+   pub kind:                FreeformItemKind,
+   /// Nested objects in the order declared by this object's child references.
+   pub children:            Vec<Self>,
+   /// Exact named payload ranges; all original bytes remain in the native
+   /// archive.
+   pub record_ranges:       Vec<FreeformRecordRange>,
 }
 
 /// Compatibility of a decoded native archive, from the Freeform versions its
@@ -683,8 +849,9 @@ pub struct FreeformBoardItem {
 /// A version is a list of dotted components (`[2, 4]` is Freeform 2.4). An
 /// archive needs the newer of its minimum version and its version for
 /// good-enough fidelity; it is supported when the decoders have been verified
-/// on archives needing that version (2.4, the version copies from Freeform 5.1
-/// declare).
+/// on archives needing that version. The maximum includes nested objects:
+/// Freeform 5.1's captured premium image requires 4.4 even when its pasteboard
+/// root declares 2.4 for good-enough fidelity.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(
    feature = "serde",
@@ -696,10 +863,16 @@ pub enum FreeformCompatibility {
    #[default]
    Unknown,
    /// The archive needs Freeform `version`, which the decoders are verified on.
-   Supported { version: Vec<u32> },
+   Supported {
+      /// Required Freeform version as dotted components.
+      version: Vec<u32>,
+   },
    /// The archive needs Freeform `version`, newer than the decoders are
    /// verified on: its records may use layouts they misread or skip.
-   Unsupported { version: Vec<u32> },
+   Unsupported {
+      /// Required Freeform version as dotted components.
+      version: Vec<u32>,
+   },
 }
 
 /// Everything recovered from `CRLNativeData` and its correlated flavors.
@@ -842,7 +1015,7 @@ pub struct FreeformBlobs {
    serde(rename_all = "camelCase")
 )]
 pub struct FreeformNativeMetadata {
-   /// Paste UUID shared with the CRL native index.
+   /// Paste UUID shared with the `CRL` native index.
    pub paste_id: Option<String>,
    /// Original metadata protobuf.
    pub raw_data: Vec<u8>,
@@ -884,6 +1057,8 @@ pub struct FreeformDiagnostic {
    serde(rename_all = "camelCase")
 )]
 pub struct FreeformPasteboard {
+   /// Original flavors in capture order, before transport chunks are assembled.
+   pub flavors:         Vec<FreeformFlavor>,
    /// `PencilKit` tier outcome.
    pub drawing:         FreeformTier<FreeformDrawing>,
    /// Native graph tier outcome.

@@ -37,44 +37,43 @@ export interface FreeformGeometry {
   readonly widthValid?: boolean;
   readonly heightValid?: boolean;
 }
-/** A normalized sRGB color and its source color space. */
+/** Exact components in the declared native color model. */
+export type FreeformColorComponents =
+  | { readonly kind: 'rgb'; readonly red: number; readonly green: number; readonly blue: number }
+  | {
+      readonly kind: 'cmyk';
+      readonly cyan: number;
+      readonly magenta: number;
+      readonly yellow: number;
+      readonly black: number;
+    }
+  | { readonly kind: 'monochrome'; readonly white: number };
+/** A source-space color; hex is present only when an exact sRGB conversion is known. */
 export interface FreeformColor {
   readonly colorSpace: string;
-  readonly red: number;
-  readonly green: number;
-  readonly blue: number;
+  readonly components: FreeformColorComponents;
   readonly alpha: number;
-  readonly hex: string;
-}
-/** One gradient stop. */
-export interface FreeformGradientStop {
-  readonly fraction: number;
-  readonly inflection?: number;
-  readonly color: FreeformColor;
+  readonly hex?: string;
 }
 /** A native fill or stroke paint. */
 export type FreeformPaint =
   | { readonly kind: 'solid'; readonly color: FreeformColor }
-  | {
-      readonly kind: 'linearGradient';
-      readonly start: FreeformPoint;
-      readonly end: FreeformPoint;
-      readonly stops: readonly FreeformGradientStop[];
-    }
-  | {
-      readonly kind: 'radialGradient';
-      readonly center: FreeformPoint;
-      readonly radius: number;
-      readonly stops: readonly FreeformGradientStop[];
-    }
-  | { readonly kind: 'image'; readonly assetId: string; readonly technique?: string }
   | { readonly kind: 'unknown'; readonly rawData: Uint8Array };
+/** Native PencilKit brush configuration attached to a geometric stroke. */
+export interface FreeformPencilKitStrokeStyle {
+  readonly inkType: string;
+  readonly width: number;
+  readonly fountainPenV2?: boolean;
+}
 /** Stroke styling for shapes and connectors. */
 export interface FreeformStrokeStyle {
   readonly paint: FreeformPaint;
   readonly width: number;
   readonly dash: readonly number[];
   readonly dashOffset?: number;
+  readonly patternOffsetDistance?: number;
+  readonly smartStroke?: string;
+  readonly pencilKit?: FreeformPencilKitStrokeStyle;
   readonly cap?: string;
   readonly join?: string;
   readonly miterLimit?: number;
@@ -90,6 +89,7 @@ export interface FreeformShadow {
   readonly radius: number;
   readonly opacity?: number;
   readonly angle?: number;
+  readonly curve?: number;
 }
 /** Shared item styling. */
 export interface FreeformStyle {
@@ -113,6 +113,7 @@ export interface FreeformInkPoint {
   readonly altitude?: number;
   readonly secondaryScale?: number;
   readonly threshold?: number;
+  readonly edgeWidth?: number;
 }
 /** A visible interval of a masked PencilKit path. */
 export interface FreeformInkRange {
@@ -128,6 +129,7 @@ export interface FreeformInkStroke {
   readonly pointRole: FreeformInkPointRole;
   readonly points: readonly FreeformInkPoint[];
   readonly visibleRanges?: readonly FreeformInkRange[];
+  readonly mask?: FreeformPath;
   readonly randomSeed?: number;
   readonly rawData: Uint8Array;
 }
@@ -149,10 +151,30 @@ export type FreeformPathCommand =
       readonly point: FreeformPoint;
     }
   | { readonly kind: 'close' };
+/** Parameters for native paths without an explicit Bézier command list. */
+export type FreeformPathSource =
+  | { readonly kind: 'point'; readonly name: string; readonly point: FreeformPoint }
+  | {
+      readonly kind: 'scalar';
+      readonly name: string;
+      readonly scalar: number;
+      readonly curveContinuous: boolean;
+      readonly showKnob: boolean;
+    }
+  | {
+      readonly kind: 'callout';
+      readonly tailPosition: FreeformPoint;
+      readonly tailSize: number;
+      readonly cornerRadius: number;
+      readonly centerTail: boolean;
+    };
 /** An ordered local shape path. */
 export interface FreeformPath {
   readonly commands: readonly FreeformPathCommand[];
   readonly naturalSize?: FreeformSize;
+  readonly source?: FreeformPathSource;
+  readonly horizontalFlip?: boolean;
+  readonly verticalFlip?: boolean;
   readonly rawData: Uint8Array;
 }
 /** Recursive value retained from a TSUDescription routing hint. */
@@ -185,12 +207,14 @@ export interface FreeformTextRun {
   readonly writingDirection?: string;
   readonly hyperlink?: string;
   readonly listStyle?: string;
+  readonly listStart?: number;
+  readonly paragraphLevel?: number;
 }
 /** Native text with style runs. */
 export interface FreeformText {
   readonly plain: string;
   readonly runs: readonly FreeformTextRun[];
-  readonly inset?: FreeformFrame;
+  readonly inset?: number;
   readonly verticalAlignment?: string;
   readonly shrinkToFit?: boolean;
 }
@@ -223,9 +247,21 @@ export interface FreeformAsset {
   readonly intrinsicSize?: FreeformSize;
   readonly rawDescriptor: Uint8Array;
 }
+/** Native table rendering and layout flags. */
+export interface FreeformTableOptions {
+  readonly borderOptions?: number;
+  readonly roundedCorners?: boolean;
+  readonly cellAutogrow?: boolean;
+  readonly rightToLeft?: boolean;
+}
 /** Item-specific native payload. */
 export type FreeformItemKind =
-  | { readonly kind: 'shape'; readonly preset?: string; readonly path?: FreeformPath }
+  | {
+      readonly kind: 'shape';
+      readonly preset?: string;
+      readonly path?: FreeformPath;
+      readonly text?: FreeformText;
+    }
   | { readonly kind: 'textBox'; readonly text?: FreeformText }
   | { readonly kind: 'stickyNote'; readonly text?: FreeformText }
   | {
@@ -240,6 +276,7 @@ export type FreeformItemKind =
       readonly rowHeights: readonly number[];
       readonly columnWidths: readonly number[];
       readonly cells: readonly FreeformTableCell[];
+      readonly options: FreeformTableOptions;
     }
   | {
       readonly kind: 'image';
@@ -254,6 +291,7 @@ export type FreeformItemKind =
       readonly kind: 'usdz';
       readonly assetId?: string;
       readonly spatialTransform?: readonly number[];
+      readonly orientation?: readonly [number, number, number, number];
     }
   | {
       readonly kind: 'group';
@@ -264,22 +302,31 @@ export type FreeformItemKind =
   | { readonly kind: 'unknown' };
 /** One structurally owned record in a native archive. */
 export interface FreeformRecordRange {
+  readonly name: string;
   readonly offset: number;
   readonly length: number;
 }
 
+/** A child item's exact cell-relative placement. */
+export interface FreeformTableAnchor {
+  readonly cellId: string;
+  readonly geometry: FreeformGeometry;
+}
 /** One entry of the native object's ordered board-item list. */
 export interface FreeformBoardItem {
   readonly index: number;
   readonly uuid: string;
   readonly parentId?: string;
+  readonly tableAnchor?: FreeformTableAnchor;
+  readonly persistenceType: number;
+  readonly persistenceSubtype?: number;
   readonly className?: string;
   readonly hints: Readonly<Record<string, TsuValue>>;
   readonly geometry: FreeformGeometry;
   readonly style: FreeformStyle;
   readonly kind: FreeformItemKind;
+  readonly children: readonly FreeformBoardItem[];
   readonly recordRanges: readonly FreeformRecordRange[];
-  readonly rawData: Uint8Array;
 }
 /**
  * Compatibility of a decoded native archive: the Freeform version it needs
@@ -343,6 +390,8 @@ export interface FreeformDiagnostic {
 }
 /** A decoded Freeform selection assembled without losing supplied flavors. */
 export interface FreeformPasteboard {
+  /** Original flavors in capture order, before transport reassembly. */
+  readonly flavors: readonly FreeformFlavor[];
   readonly drawing: FreeformTier<FreeformDrawing>;
   readonly native: FreeformTier<FreeformNative>;
   readonly manifest: FreeformTier<readonly TsuEntry[]>;

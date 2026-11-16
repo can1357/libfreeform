@@ -31,7 +31,7 @@ function failed(tier, name) {
  * @returns number of checks run
  */
 export function runChecks(api, fixtures) {
-  const { inkPen, nativeMixed, tsuDescription, realBoardNative, realBoardTsu } = fixtures;
+  const { inkPen, tsuDescription, realBoardNative, realBoardTsu } = fixtures;
   let count = 0;
   const check = (name, fn) => {
     try {
@@ -57,6 +57,12 @@ export function runChecks(api, fixtures) {
       'metadata UTI',
     );
     assertEq(api.classifyBlob('com.apple.freeform.CRLAsset.placeholder'), 'asset', 'asset UTI');
+    assertEq(
+      api.classifyBlob('com.apple.freeform.pasteboardState.CRLNativeData'),
+      'state',
+      'native name inside a state flag is not native data',
+    );
+    assertEq(api.classifyBlob('unrelated_CRLNativeData.bin'), undefined, 'unrelated dump name');
     assertEq(
       api.classifyBlob('com.apple.freeform.pasteboardState.selection'),
       'state',
@@ -122,8 +128,8 @@ export function runChecks(api, fixtures) {
         changeCount: 42,
         flavors: [
           { uti: 'com.apple.drawing', bytes: inkPen },
-          { uti: 'com.apple.freeform.CRLNativeData', bytes: nativeMixed },
-          { uti: 'com.apple.freeform.TSUDescription', bytes: tsuDescription },
+          { uti: 'com.apple.freeform.CRLNativeData', bytes: realBoardNative },
+          { uti: 'com.apple.freeform.TSUDescription', bytes: realBoardTsu },
           { uti: 'public.png', bytes: render },
           { uti: 'com.apple.freeform.CRLNativeMetadata', bytes: new Uint8Array() },
           { uti: 'com.apple.freeform.CRLAsset.placeholder', bytes: new Uint8Array() },
@@ -132,7 +138,7 @@ export function runChecks(api, fixtures) {
         ],
       });
       assertEq(decoded(decodedPasteboard.drawing, 'drawing').strokes.length, 2, 'drawing content');
-      assertEq(decoded(decodedPasteboard.native, 'native').items.length, 3, 'native content');
+      assertEq(decoded(decodedPasteboard.native, 'native').items.length, 10, 'native content');
       assertEq(
         [...decodedPasteboard.renders[0].bytes],
         [...render],
@@ -161,13 +167,13 @@ export function runChecks(api, fixtures) {
     const result = api.decodePasteboard({
       flavors: [
         { uti: 'com.apple.drawing', bytes: new TextEncoder().encode('wrd\xff\xff') },
-        { uti: 'com.apple.freeform.CRLNativeData', bytes: nativeMixed },
-        { uti: 'com.apple.freeform.TSUDescription', bytes: tsuDescription },
+        { uti: 'com.apple.freeform.CRLNativeData', bytes: realBoardNative },
+        { uti: 'com.apple.freeform.TSUDescription', bytes: realBoardTsu },
       ],
     });
     failed(result.drawing, 'drawing');
-    assertEq(decoded(result.native, 'native').items.length, 3, 'native survives drawing failure');
-    assertEq(decoded(result.manifest, 'manifest').length, 3, 'manifest survives drawing failure');
+    assertEq(decoded(result.native, 'native').items.length, 10, 'native survives drawing failure');
+    assertEq(decoded(result.manifest, 'manifest').length, 10, 'manifest survives drawing failure');
   });
 
   check('TSU-only and render-only snapshots remain meaningful', () => {
@@ -187,16 +193,31 @@ export function runChecks(api, fixtures) {
 
   check('rich item variants carry geometry, style, and tagged data', () => {
     const native = api.decodeCrlNative(realBoardNative, realBoardTsu);
-    assertEq(native.compatibility, { kind: 'supported', version: [2, 4] }, 'compatibility');
+    assertEq(
+      native.compatibility,
+      { kind: 'supported', version: [4, 4] },
+      'nested-object compatibility',
+    );
     assertEq(native.items.length, 10, 'board item count');
     const sticky = native.items[7];
-    assert(sticky.geometry.frame != null, 'item local geometry');
-    assert(sticky.style != null && Array.isArray(sticky.style.shadows), 'item style');
-    assert(typeof sticky.kind.kind === 'string', 'tagged item variant');
+    assertEq(sticky.kind.text.plain, 'hi', 'native sticky text');
+    assertEq(sticky.style.fill.color.hex, '#FFE16C', 'native sticky color');
+    assertEq(native.items[0].kind.kind, 'textBox', 'textbox hint refines native shape');
     const table = native.items[8];
-    assert(table.kind.kind === 'table', 'table variant');
+    assertEq(table.kind.columnWidths, [344, 344], 'native table columns');
+    assertEq(
+      table.kind.cells.filter(cell => cell.text?.plain === 'aaa').length,
+      3,
+      'native cell text',
+    );
+    assertEq(table.children[0].tableAnchor.geometry.frame.x, 97, 'cell-local anchored shape');
+    assert(
+      table.kind.cells.some(cell => cell.anchoredItemIds.includes(table.children[0].uuid)),
+      'cell references nested shape',
+    );
     const image = native.items[9];
-    assert(image.kind.kind === 'image', 'image variant');
+    assert(image.kind.assetId != null, 'native image asset reference');
+    assert(native.assets[image.kind.assetId] != null, 'native asset descriptor');
   });
 
   check('content detection uses exact snapshot flavors', () => {
@@ -210,12 +231,37 @@ export function runChecks(api, fixtures) {
       'non-PK drawing',
     );
     assert(
-      api.hasFreeformContent({
+      !api.hasFreeformContent({
         flavors: [{ uti: 'com.apple.freeform.CRLNativeData', bytes: new Uint8Array() }],
       }),
-      'native snapshot',
+      'empty native data is not importable',
     );
   });
+
+  check(
+    'numbered native transport retains original flavors and restores the complete graph',
+    () => {
+      const flavors = [
+        { uti: 'com.apple.freeform.CRLNativeData.1', bytes: realBoardNative.slice(1024) },
+        { uti: 'com.apple.freeform.CRLNativeData', bytes: realBoardNative.slice(0, 1024) },
+      ];
+      const snapshot = api.decodePasteboard({ flavors });
+      assertEq(
+        decoded(snapshot.native, 'chunked native').items[7].kind.text.plain,
+        'hi',
+        'reassembled content',
+      );
+      assertEq(
+        snapshot.flavors.map(flavor => flavor.uti),
+        flavors.map(flavor => flavor.uti),
+        'capture order',
+      );
+      assert(
+        snapshot.flavors.every(flavor => flavor.bytes instanceof Uint8Array),
+        'raw chunk bytes',
+      );
+    },
+  );
 
   return count;
 }

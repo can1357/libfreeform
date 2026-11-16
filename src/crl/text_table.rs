@@ -1,475 +1,539 @@
-//! Record-bounded decoders for TSWP text and CRL table payloads.
+//! Freeform's native text storage and table capsule schemas.
 //!
-//! The native archive uses protobuf-shaped messages, but its field schema is
-//! versioned.  This module therefore only assigns a value when its wire field
-//! and representation prove the mapping; unrecognised nested data stays in the
-//! owning `NativeRecord` bytes rather than becoming a guessed public value.
+//! Text is `CRLWPStorageCRDTData.a`; `.b` is instructional text, not content.
+//! `Proto_Sequence.attributeRuns` contains consecutive UTF-16 lengths and named
+//! `CRValues`. Table rows/columns are ordered UUID dictionaries; cells are
+//! keyed by the native `(rowID, columnID)` value, not by their reference-record
+//! order.
 
-use super::envelope::NativeRecord;
+use std::collections::BTreeMap;
+
+use super::{
+   coherence::{Document, Node, Value},
+   invalid, shape,
+};
 use crate::types::{
-   FreeformColor, FreeformDecodeError, FreeformFrame, FreeformPaint, FreeformStyle,
-   FreeformTableCell, FreeformText, FreeformTextRun,
+   FreeformDecodeError, FreeformStyle, FreeformTableCell, FreeformTableOptions, FreeformText,
+   FreeformTextRun,
 };
 
-#[derive(Clone, Copy)]
-enum Wire<'a> {
-   Varint(u64),
-   Fixed32(u32),
-   Fixed64(u64),
-   Bytes(&'a [u8]),
-}
-type ParsedFields<'a> = Vec<(u32, Wire<'a>)>;
-
-/// Parses one bounded protobuf-shaped message without reading beyond `data`.
-fn fields(data: &[u8]) -> Result<ParsedFields<'_>, FreeformDecodeError> {
-   let mut out = Vec::new();
-   let mut at = 0;
-   while at < data.len() {
-      let key = varint(data, &mut at)?;
-      let field = (key >> 3) as u32;
-      if field == 0 {
-         return Err(FreeformDecodeError::invalid("CRL record contains field zero"));
-      }
-      let value = match key & 7 {
-         0 => Wire::Varint(varint(data, &mut at)?),
-         1 => {
-            let b = take(data, &mut at, 8)?;
-            Wire::Fixed64(u64::from_le_bytes(b.try_into().expect("fixed-width slice")))
-         },
-         2 => {
-            let len = usize::try_from(varint(data, &mut at)?)
-               .map_err(|_| FreeformDecodeError::invalid("CRL length exceeds address space"))?;
-            Wire::Bytes(take(data, &mut at, len)?)
-         },
-         5 => {
-            let b = take(data, &mut at, 4)?;
-            Wire::Fixed32(u32::from_le_bytes(b.try_into().expect("fixed-width slice")))
-         },
-         wire => {
-            return Err(FreeformDecodeError::invalid(format!(
-               "CRL record has unsupported wire type {wire}"
-            )));
-         },
-      };
-      out.push((field, value));
-   }
-   Ok(out)
+type Result<T, E = FreeformDecodeError> = std::result::Result<T, E>;
+pub(super) struct DecodedTable {
+   pub row_heights:   Vec<f64>,
+   pub column_widths: Vec<f64>,
+   pub cells:         Vec<FreeformTableCell>,
+   pub style:         FreeformStyle,
+   pub options:       FreeformTableOptions,
 }
 
-fn take<'a>(data: &'a [u8], at: &mut usize, len: usize) -> Result<&'a [u8], FreeformDecodeError> {
-   let end = at
-      .checked_add(len)
-      .ok_or_else(|| FreeformDecodeError::incomplete("CRL length overflow"))?;
-   let value = data
-      .get(*at..end)
-      .ok_or_else(|| FreeformDecodeError::incomplete("truncated CRL record"))?;
-   *at = end;
-   Ok(value)
+fn number(value: Option<Value<'_>>) -> Result<Option<f64>> {
+   value.map(Value::number).transpose().map(Option::flatten)
 }
 
-fn varint(data: &[u8], at: &mut usize) -> Result<u64, FreeformDecodeError> {
-   let mut value = 0u64;
-   for shift in (0..64).step_by(7) {
-      let byte = *data
-         .get(*at)
-         .ok_or_else(|| FreeformDecodeError::incomplete("truncated CRL varint"))?;
-      *at += 1;
-      let payload = u64::from(byte & 0x7f);
-      if shift == 63 && payload > 1 {
-         return Err(FreeformDecodeError::invalid("CRL varint exceeds 64 bits"));
-      }
-      value |= payload << shift;
-      if byte & 0x80 == 0 {
-         return Ok(value);
-      }
-   }
-   Err(FreeformDecodeError::invalid("CRL varint exceeds 64 bits"))
+fn integer(value: Option<Value<'_>>) -> Result<Option<i64>> {
+   value.map(Value::integer).transpose().map(Option::flatten)
 }
 
-fn string(value: Wire<'_>) -> Option<String> {
-   match value {
-      Wire::Bytes(bytes) => std::str::from_utf8(bytes).ok().map(str::to_owned),
-      _ => None,
-   }
+fn boolean(value: Option<Value<'_>>) -> Result<Option<bool>> {
+   value.map(Value::boolean).transpose().map(Option::flatten)
 }
 
-fn number(value: Wire<'_>) -> Option<f64> {
-   match value {
-      Wire::Varint(value) => Some(value as f64),
-      Wire::Fixed32(value) => Some(f64::from(f32::from_bits(value))),
-      Wire::Fixed64(value) => Some(f64::from_bits(value)),
-      Wire::Bytes(_) => None,
-   }
+fn string(value: Option<Value<'_>>) -> Result<Option<String>> {
+   Ok(value
+      .map(Value::string)
+      .transpose()?
+      .flatten()
+      .map(str::to_owned))
 }
 
-fn dimensions(value: Wire<'_>) -> Vec<f64> {
-   match value {
-      Wire::Bytes(bytes) if bytes.len() % 4 == 0 => bytes
-         .chunks_exact(4)
-         .map(|bytes| f64::from(f32::from_le_bytes(bytes.try_into().expect("fixed-width chunk"))))
-         .filter(|value| value.is_finite())
-         .collect(),
-      value => number(value)
-         .filter(|value| value.is_finite())
-         .into_iter()
-         .collect(),
-   }
+fn coding_field(value: Value<'_>, key: u64) -> Result<Option<Value<'_>>> {
+   value
+      .field(key)?
+      .map(Value::optional)
+      .transpose()
+      .map(Option::flatten)
 }
 
-const fn boolean(value: Wire<'_>) -> Option<bool> {
-   match value {
-      Wire::Varint(0) => Some(false),
-      Wire::Varint(1) => Some(true),
-      _ => None,
-   }
+fn named_enum(
+   value: Option<Value<'_>>,
+   names: &[(i64, &str)],
+   kind: &str,
+) -> Result<Option<String>> {
+   integer(value)?
+      .map(|value| {
+         names
+            .iter()
+            .find(|(number, _)| *number == value)
+            .map(|(_, name)| (*name).to_owned())
+            .ok_or_else(|| {
+               FreeformDecodeError::unsupported(format!("native text: {kind} value {value}"))
+            })
+      })
+      .transpose()
 }
 
-fn index(value: Wire<'_>) -> Option<usize> {
-   match value {
-      Wire::Varint(value) => usize::try_from(value).ok(),
-      _ => None,
-   }
+fn alignment(value: Option<Value<'_>>) -> Result<Option<String>> {
+   named_enum(
+      value,
+      &[(0, "left"), (1, "right"), (2, "center"), (3, "justified"), (4, "natural")],
+      "paragraph alignment",
+   )
 }
 
-fn color(data: &[u8]) -> Option<FreeformPaint> {
-   let fields = fields(data).ok()?;
-   let mut channels = [None; 4];
-   for (field, value) in fields {
-      if let 1..=4 = field {
-         let value = number(value)?;
-         if !(0.0..=1.0).contains(&value) || !value.is_finite() {
-            return None;
-         }
-         channels[(field - 1) as usize] = Some(value);
-      }
-   }
-   let [Some(red), Some(green), Some(blue), Some(alpha)] = channels else {
-      return None;
+fn direction(value: Option<Value<'_>>) -> Result<Option<String>> {
+   named_enum(
+      value,
+      &[(-1, "natural"), (0, "left-to-right"), (1, "right-to-left")],
+      "writing direction",
+   )
+}
+
+fn vertical(value: Option<Value<'_>>) -> Result<Option<String>> {
+   named_enum(
+      value,
+      &[(0, "top"), (1, "middle"), (2, "bottom"), (3, "justify")],
+      "vertical alignment",
+   )
+}
+
+fn list_style(value: Option<Value<'_>>) -> Result<Option<String>> {
+   named_enum(value, &[(0, "none"), (1, "numbered"), (2, "dashed"), (3, "bulleted")], "list style")
+}
+
+/// `NSUnderlineStyle` is an option set, shared by underline and strikethrough.
+fn decoration(value: Option<Value<'_>>) -> Result<Option<String>> {
+   let Some(value) = integer(value)? else {
+      return Ok(None);
    };
-   let byte = |value: f64| (value * 255.0).round() as u8;
-   Some(FreeformPaint::Solid {
-      color: FreeformColor {
-         color_space: "sRGB".to_owned(),
-         red,
-         green,
-         blue,
-         alpha,
-         hex: format!("#{:02x}{:02x}{:02x}", byte(red), byte(green), byte(blue)),
+   let line = match value & 0xff {
+      0 => "none",
+      1 => "single",
+      2 => "thick",
+      9 => "double",
+      _ => {
+         return Err(FreeformDecodeError::unsupported(format!("native text: decoration {value}")));
       },
-   })
+   };
+   let pattern = match value & 0x700 {
+      0 => "",
+      0x100 => " dot",
+      0x200 => " dash",
+      0x300 => " dash-dot",
+      0x400 => " dash-dot-dot",
+      _ => {
+         return Err(FreeformDecodeError::unsupported(format!(
+            "native text: decoration pattern {value}"
+         )));
+      },
+   };
+   if value & !0x87ff != 0 {
+      return Err(FreeformDecodeError::unsupported(format!(
+         "native text: decoration flags {value}"
+      )));
+   }
+   Ok(Some(format!("{line}{pattern}{}", if value & 0x8000 != 0 { " by-word" } else { "" })))
 }
 
-fn frame(data: &[u8]) -> Option<FreeformFrame> {
-   let values: Vec<f64> = fields(data)
-      .ok()?
-      .into_iter()
-      .filter_map(|(_, value)| number(value))
+/// `CRLWPTextPresetData`'s integer `CodingKeys`, verified by its native
+/// descriptor.
+fn apply_preset(run: &mut FreeformTextRun, preset: Option<Value<'_>>) -> Result<()> {
+   let Some(preset) = preset else {
+      return Ok(());
+   };
+   macro_rules! apply {
+      ($field:ident, $value:expr) => {
+         if let Some(value) = $value? {
+            run.$field = Some(value);
+         }
+      };
+   }
+   apply!(font_name, string(coding_field(preset, 0)?));
+   apply!(font_size, number(coding_field(preset, 1)?));
+   apply!(bold, boolean(coding_field(preset, 2)?));
+   apply!(italic, boolean(coding_field(preset, 3)?));
+   apply!(underline, decoration(coding_field(preset, 4)?));
+   apply!(strikethrough, decoration(coding_field(preset, 5)?));
+   if let Some(value) = coding_field(preset, 6)? {
+      apply!(fill, shape::paint(value));
+   }
+   apply!(paragraph_alignment, alignment(coding_field(preset, 7)?));
+   apply!(writing_direction, direction(coding_field(preset, 8)?));
+   apply!(list_style, list_style(coding_field(preset, 9)?));
+   apply!(list_start, integer(coding_field(preset, 10)?));
+   Ok(())
+}
+
+fn apply_attribute(run: &mut FreeformTextRun, name: &str, value: Value<'_>) -> Result<()> {
+   let Some(value) = value.optional()? else {
+      return Ok(());
+   };
+   match name {
+      "fontName" => run.font_name = string(Some(value))?,
+      "fontSize" => run.font_size = number(Some(value))?,
+      "bold" => run.bold = boolean(Some(value))?,
+      "italic" => run.italic = boolean(Some(value))?,
+      "underline" => run.underline = decoration(Some(value))?,
+      "strikethrough" => run.strikethrough = decoration(Some(value))?,
+      "characterFill" => run.fill = shape::paint(value)?,
+      "paragraphAlignment" => run.paragraph_alignment = alignment(Some(value))?,
+      "baseWritingDirection" => run.writing_direction = direction(Some(value))?,
+      "listStyle" => run.list_style = list_style(Some(value))?,
+      "listStart" => run.list_start = integer(Some(value))?,
+      "paragraphLevel" => run.paragraph_level = integer(Some(value))?,
+      // CRLWPHyperlinkSmartFieldData: 0 type, 1 optional URL, 2 UUID.
+      "hyperlink" => {
+         run.hyperlink = coding_field(value, 1)?
+            .map(Value::url)
+            .transpose()?
+            .flatten();
+      },
+      _ => {},
+   }
+   Ok(())
+}
+
+/// Converts monotonically increasing UTF-16 boundaries without a second string
+/// allocation or rescanning earlier runs. A boundary inside a surrogate pair is
+/// malformed; rounding would silently assign attributes to the wrong character.
+struct Utf16Cursor<'a> {
+   remaining: &'a str,
+   byte:      usize,
+}
+
+impl<'a> Utf16Cursor<'a> {
+   const fn new(text: &'a str) -> Self {
+      Self { remaining: text, byte: 0 }
+   }
+
+   fn advance(&mut self, mut length: u64) -> Result<usize> {
+      while length != 0 {
+         let character = self
+            .remaining
+            .chars()
+            .next()
+            .ok_or_else(|| invalid("text attribute range exceeds its string"))?;
+         length = length
+            .checked_sub(character.len_utf16() as u64)
+            .ok_or_else(|| invalid("text attribute range splits a UTF-16 surrogate pair"))?;
+         self.byte += character.len_utf8();
+         self.remaining = &self.remaining[character.len_utf8()..];
+      }
+      Ok(self.byte)
+   }
+}
+
+fn attributed_string(node: Node<'_>, base: &FreeformTextRun) -> Result<Option<FreeformText>> {
+   let Some(string) = node.crdt()?.string else {
+      return Ok(None);
+   };
+   let plain = string.text.unwrap_or_default();
+   let mut cursor = Utf16Cursor::new(plain);
+   let mut runs = Vec::new();
+   for attribute_run in string.attribute_runs {
+      let attribute_run = attribute_run?;
+      let start = cursor.byte;
+      let end = cursor.advance(attribute_run.length.unwrap_or(0))?;
+      let mut run = base.clone();
+      run.start = start;
+      run.end = end;
+      for attribute in attribute_run.attributes {
+         let attribute = attribute?;
+         let key = node.context.string(attribute.key.unwrap_or(0))?;
+         let value = attribute
+            .value
+            .ok_or_else(|| invalid("text attribute has no value"))?;
+         apply_attribute(&mut run, key, node.context.value(value))?;
+      }
+      runs.push(run);
+   }
+   if runs.is_empty() {
+      if !plain.is_empty() {
+         runs.push(FreeformTextRun { start: 0, end: plain.len(), ..base.clone() });
+      }
+   } else if !cursor.remaining.is_empty() {
+      return Err(invalid("text attribute runs do not cover their string"));
+   }
+   Ok(Some(FreeformText { plain: plain.to_owned(), runs, ..FreeformText::default() }))
+}
+
+fn storage_text(storage: Option<Node<'_>>, base: &FreeformTextRun) -> Result<Option<FreeformText>> {
+   let Some(storage) = storage else {
+      return Ok(None);
+   };
+   let Some(text) = storage.field("a")? else {
+      return Ok(None);
+   };
+   attributed_string(text, base)
+}
+
+fn shape_text_style(text: &mut FreeformText, style: Option<Node<'_>>) -> Result<()> {
+   let Some(style) = style else {
+      return Ok(());
+   };
+   if let Some(value) = number(style.property("a")?)? {
+      text.inset = Some(value);
+   }
+   if let Some(value) = vertical(style.property("b")?)? {
+      text.vertical_alignment = Some(value);
+   }
+   if let Some(value) = boolean(style.property("c")?)? {
+      text.shrink_to_fit = Some(value);
+   }
+   Ok(())
+}
+
+/// `WPShape` labels and textboxes share storage; sticky notes wrap that shape
+/// in a.
+pub(super) fn decode_text(
+   specific: Node<'_>,
+   persistence_type: u32,
+) -> Result<Option<FreeformText>> {
+   let shape = match persistence_type {
+      3 => specific,
+      12 => match specific.field("a")? {
+         Some(shape) => shape,
+         None => return Ok(None),
+      },
+      _ => return Ok(None),
+   };
+   let mut base = FreeformTextRun::default();
+   apply_preset(&mut base, shape.property("d")?)?;
+   let Some(mut text) = storage_text(shape.field("b")?, &base)? else {
+      return Ok(None);
+   };
+   shape_text_style(&mut text, shape.field("c")?)?;
+   Ok(Some(text))
+}
+
+fn axis(
+   document: Document<'_>,
+   node: Option<Node<'_>>,
+   default: f64,
+) -> Result<(Vec<String>, Vec<f64>)> {
+   let Some(node) = node else {
+      return Ok((Vec::new(), Vec::new()));
+   };
+   let entries = node.ordered_dictionary()?;
+   let mut ids = Vec::with_capacity(entries.len());
+   let mut dimensions = Vec::with_capacity(entries.len());
+   for (key, reference) in entries {
+      let id = key
+         .uuid()?
+         .ok_or_else(|| invalid("table axis key is not a UUID"))?;
+      let data = document
+         .resolve(reference)?
+         .ok_or_else(|| invalid("unresolved table axis reference"))?;
+      ids.push(id);
+      dimensions.push(number(data.property("a")?)?.unwrap_or(default));
+   }
+   Ok((ids, dimensions))
+}
+
+fn table_text_style(text: &mut FreeformText, style: Option<Node<'_>>) -> Result<()> {
+   let Some(style) = style else {
+      return Ok(());
+   };
+   text.vertical_alignment = vertical(style.property("a")?)?;
+   text.inset = number(style.property("b")?)?;
+   Ok(())
+}
+
+/// Decodes the capsule root and only its explicitly referenced live records.
+/// Missing cell records are genuine empty cells, not missing rows or columns.
+/// Default dimensions are native `CRLTableItem` getter defaults (258 / 344 pt).
+/// Anchored children are associated by the caller using their common anchor
+/// hint.
+pub(super) fn decode_table(capsule: Document<'_>) -> Result<DecodedTable> {
+   let root = capsule
+      .root()?
+      .ok_or_else(|| invalid("table capsule has no root"))?;
+   let (row_ids, rows) = axis(capsule, root.field("b")?, 258.0)?;
+   let (column_ids, columns) = axis(capsule, root.field("c")?, 344.0)?;
+   let count = rows
+      .len()
+      .checked_mul(columns.len())
+      .ok_or_else(|| invalid("table dimensions overflow"))?;
+   let row_indices: BTreeMap<_, _> = row_ids
+      .iter()
+      .enumerate()
+      .map(|(index, id)| (id.as_str(), index))
       .collect();
-   (values.len() == 5).then(|| FreeformFrame {
-      x:        values[0],
-      y:        values[1],
-      w:        values[2],
-      h:        values[3],
-      rotation: values[4],
-   })
-}
-
-fn text_run(data: &[u8]) -> Option<FreeformTextRun> {
-   let mut run = FreeformTextRun::default();
-   for (field, value) in fields(data).ok()? {
-      match field {
-         1 => run.start = index(value)?,
-         2 => run.end = index(value)?,
-         3 => run.font_name = string(value),
-         4 => run.font_size = number(value),
-         5 => run.bold = boolean(value),
-         6 => run.italic = boolean(value),
-         7 => run.underline = string(value),
-         8 => run.strikethrough = string(value),
-         9 => {
-            if let Wire::Bytes(data) = value {
-               run.fill = color(data);
-            }
-         },
-         10 => run.paragraph_alignment = string(value),
-         11 => run.writing_direction = string(value),
-         12 => run.hyperlink = string(value),
-         13 => run.list_style = string(value),
-         _ => {},
-      }
-   }
-   (run.end >= run.start).then_some(run)
-}
-
-/// Decodes a TSWP text record without scanning outside that record.
-///
-/// Field 1 is the verified UTF-8 content field.  Empty, one-character,
-/// multiline, control-containing, long, and identifier-looking content are
-/// retained verbatim.  Runs are emitted only when their byte bounds are valid.
-pub fn decode_text(record: &NativeRecord<'_>) -> Result<FreeformText, FreeformDecodeError> {
-   let root = fields(record.bytes)?;
-   let plain = root
+   let column_indices: BTreeMap<_, _> = column_ids
       .iter()
-      .find_map(|(field, value)| (*field == 1).then(|| string(*value)).flatten())
-      .ok_or_else(|| FreeformDecodeError::invalid("TSWP record has no UTF-8 text field"))?;
-   let mut text = FreeformText { plain, ..FreeformText::default() };
-   for (field, value) in root {
-      match (field, value) {
-         (2, Wire::Bytes(data)) => {
-            if let Some(run) = text_run(data)
-               && run.start <= text.plain.len()
-               && run.end <= text.plain.len()
-               && text.plain.is_char_boundary(run.start)
-               && text.plain.is_char_boundary(run.end)
-            {
-               text.runs.push(run);
-            }
-         },
-         (3, Wire::Bytes(data)) => text.inset = frame(data),
-         (4, value) => text.vertical_alignment = string(value),
-         (5, value) => text.shrink_to_fit = boolean(value),
-         _ => {},
-      }
+      .enumerate()
+      .map(|(index, id)| (id.as_str(), index))
+      .collect();
+   let table_style = root.field("e")?;
+   let text_style = match table_style {
+      Some(style) => style.field("j")?,
+      None => None,
+   };
+   let mut base = FreeformTextRun::default();
+   if let Some(style) = text_style {
+      apply_preset(&mut base, style.property("d")?)?;
    }
-   Ok(text)
-}
-
-fn cell(data: &[u8]) -> Option<FreeformTableCell> {
-   let root = fields(data).ok()?;
-   let id = root
-      .iter()
-      .find_map(|(field, value)| (*field == 1).then(|| string(*value)).flatten());
-   let mut cell = FreeformTableCell { id, ..FreeformTableCell::default() };
-   for (field, value) in root {
-      match (field, value) {
-         (2, value) => cell.row = Some(index(value)?),
-         (3, value) => cell.column = Some(index(value)?),
-         (4, value) => {
-            cell.row_span = Some(index(value)?);
-         },
-         (5, value) => {
-            cell.column_span = Some(index(value)?);
-         },
-         (6, Wire::Bytes(data)) => cell.text = decode_text_bytes(data).ok(),
-         (7, Wire::Bytes(data)) => cell.style = style(data),
-         (8, value) => {
-            if let Some(id) = string(value) {
-               cell.anchored_item_ids.push(id);
-            }
-         },
-         _ => {},
-      }
-   }
-   (cell.row_span.is_some_and(|span| span > 0) && cell.column_span.is_some_and(|span| span > 0))
-      .then_some(cell)
-}
-
-fn decode_text_bytes(bytes: &[u8]) -> Result<FreeformText, FreeformDecodeError> {
-   decode_text(&NativeRecord { owner_id: String::new(), offset: 0, bytes })
-}
-
-fn style(data: &[u8]) -> FreeformStyle {
    let mut style = FreeformStyle::default();
-   if let Ok(values) = fields(data) {
-      for (field, value) in values {
-         match (field, value) {
-            (1, Wire::Bytes(data)) => style.fill = color(data),
-            (2, Wire::Bytes(data)) => style.stroke = stroke(data),
-            _ => {},
+   let mut options = FreeformTableOptions::default();
+   if let Some(table_style) = table_style {
+      if let Some(fill) = table_style.property("g")? {
+         style.fill = shape::paint(fill)?;
+      }
+      if let Some(stroke) = table_style.property("a")? {
+         style.stroke = shape::stroke(stroke)?;
+      }
+      if let Some(border) = table_style.property("c")? {
+         options.border_options = integer(border.field(0)?)?;
+      }
+      options.rounded_corners = boolean(table_style.property("d")?)?;
+      options.cell_autogrow = boolean(table_style.property("e")?)?;
+      options.right_to_left = boolean(table_style.property("f")?)?;
+   }
+   let mut cells = Vec::with_capacity(count);
+   for (row, row_id) in row_ids.iter().enumerate() {
+      for (column, column_id) in column_ids.iter().enumerate() {
+         cells.push(FreeformTableCell {
+            id: Some(format!("{row_id}/{column_id}")),
+            row: Some(row),
+            column: Some(column),
+            row_span: Some(1),
+            column_span: Some(1),
+            style: FreeformStyle { fill: style.fill.clone(), ..FreeformStyle::default() },
+            ..FreeformTableCell::default()
+         });
+      }
+   }
+   if let Some(dictionary) = root.field("d")? {
+      for (key, reference) in dictionary.dictionary()? {
+         let row_id = key
+            .field(0)?
+            .map(Value::uuid)
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| invalid("table cell has no row UUID"))?;
+         let column_id = key
+            .field(1)?
+            .map(Value::uuid)
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| invalid("table cell has no column UUID"))?;
+         // Deleting an axis can leave an unreferenced cell in the dictionary.
+         let (Some(&row), Some(&column)) =
+            (row_indices.get(row_id.as_str()), column_indices.get(column_id.as_str()))
+         else {
+            continue;
+         };
+         let data = capsule
+            .resolve(reference)?
+            .ok_or_else(|| invalid("unresolved table cell reference"))?;
+         let cell = &mut cells[row * columns.len() + column];
+         if let Some(fill) = data.property("b")? {
+            cell.style.fill = shape::paint(fill)?;
+         }
+         let mut cell_base = base.clone();
+         apply_preset(&mut cell_base, data.property("c")?)?;
+         if let Some(mut text) = storage_text(data.field("a")?, &cell_base)? {
+            table_text_style(&mut text, text_style)?;
+            shape_text_style(&mut text, data.field("d")?)?;
+            cell.text = Some(text);
          }
       }
    }
-   style
-}
-
-fn stroke(data: &[u8]) -> Option<crate::types::FreeformStrokeStyle> {
-   let fields = fields(data).ok()?;
-   let paint = fields.iter().find_map(|(field, value)| {
-      (*field == 1)
-         .then(|| match value {
-            Wire::Bytes(data) => color(data),
-            _ => None,
-         })
-         .flatten()
-   })?;
-   let width = fields
-      .iter()
-      .find_map(|(field, value)| (*field == 2).then(|| number(*value)).flatten())?;
-   Some(crate::types::FreeformStrokeStyle {
-      paint,
-      width,
-      dash: Vec::new(),
-      dash_offset: None,
-      cap: None,
-      join: None,
-      miter_limit: None,
-      tail_end: None,
-      head_end: None,
-   })
-}
-
-/// Decoded table dimensions and cells: (rows, columns, cells).
-pub type DecodedTable = (Vec<f64>, Vec<f64>, Vec<FreeformTableCell>);
-
-/// Decodes a CRL table record as row heights, column widths, and bounded cells.
-///
-/// Dimensions are preserved in archive order.  Cells carry their explicit
-/// positions, non-zero spans, text (including embedded newlines), visual
-/// style, and explicit anchored child UUIDs.
-pub fn decode_table(record: &NativeRecord<'_>) -> Result<DecodedTable, FreeformDecodeError> {
-   let root = fields(record.bytes)?;
-   let mut columns = Vec::new();
-   let mut rows = Vec::new();
-   let mut cells = Vec::new();
-   for (field, value) in root {
-      match (field, value) {
-         (1, value) => columns.extend(dimensions(value)),
-         (2, value) => rows.extend(dimensions(value)),
-         (3, Wire::Bytes(data)) => {
-            if let Some(cell) = cell(data) {
-               cells.push(cell);
-            }
-         },
-         _ => {},
-      }
-   }
-   if columns.is_empty() && rows.is_empty() && cells.is_empty() {
-      return Err(FreeformDecodeError::invalid(
-         "CRL table record has no proven dimensions or cells",
-      ));
-   }
-   Ok((rows, columns, cells))
+   Ok(DecodedTable { row_heights: rows, column_widths: columns, cells, style, options })
 }
 
 #[cfg(test)]
 mod tests {
-   use super::*;
+   use super::{super::envelope::parse_native_archive, *};
 
-   fn bytes(field: u8, value: &[u8]) -> Vec<u8> {
-      let mut out = vec![field << 3 | 2, value.len() as u8];
-      out.extend_from_slice(value);
-      out
-   }
-
-   fn integer(field: u8, value: u8) -> Vec<u8> {
-      vec![field << 3, value]
-   }
-
-   fn float(field: u8, value: f32) -> Vec<u8> {
-      let mut out = vec![field << 3 | 5];
-      out.extend_from_slice(&value.to_le_bytes());
-      out
-   }
-
-   fn record(bytes: &[u8]) -> NativeRecord<'_> {
-      NativeRecord { owner_id: String::new(), offset: 0, bytes }
-   }
-
-   fn color(red: f32, green: f32, blue: f32, alpha: f32) -> Vec<u8> {
-      [float(1, red), float(2, green), float(3, blue), float(4, alpha)].concat()
-   }
+   const REAL: &[u8] = include_bytes!("../../fixtures/real-board.crlnative");
 
    #[test]
-   fn retains_all_previously_filtered_user_text() {
-      for plain in [
-         "a",
-         "first\nsecond\twith control",
-         "c6f3c7a1-bb39-4fa9-a4db-8d0f94a53b6d",
-         "Parallelogram_950",
-         "thumbnail.png",
-         "com.apple.user.note",
-         "a very long line that remains user text because this record is structurally a TSWP \
-          record",
-      ] {
-         let encoded = bytes(1, plain.as_bytes());
-         assert_eq!(decode_text(&record(&encoded)).unwrap().plain, plain);
-      }
-   }
-
-   #[test]
-   fn decodes_styled_ranges_and_container_properties() {
-      let fill = color(0.25, 0.5, 0.75, 1.0);
-      let run = [
-         integer(1, 0),
-         integer(2, 5),
-         bytes(3, b"Helvetica-Bold"),
-         float(4, 13.5),
-         integer(5, 1),
-         integer(6, 0),
-         bytes(7, b"single"),
-         bytes(8, b"double"),
-         bytes(9, &fill),
-         bytes(10, b"center"),
-         bytes(11, b"rtl"),
-         bytes(12, b"https://example.test"),
-         bytes(13, b"bullet"),
-      ]
-      .concat();
-      let inset =
-         [float(1, 1.0), float(2, 2.0), float(3, 3.0), float(4, 4.0), float(5, 0.0)].concat();
-      let encoded =
-         [bytes(1, b"hello"), bytes(2, &run), bytes(3, &inset), bytes(4, b"middle"), integer(5, 1)]
-            .concat();
-      let text = decode_text(&record(&encoded)).unwrap();
-      assert_eq!(text.inset.unwrap().w, 3.0);
+   fn real_sticky_uses_content_not_instructional_text() {
+      let archive = parse_native_archive(REAL).unwrap();
+      let sticky = archive
+         .objects
+         .iter()
+         .find(|object| object.persistence_type == 12)
+         .unwrap();
+      let document = Document::parse(sticky.region("specificCRDTData").unwrap().bytes).unwrap();
+      let text = decode_text(document.root().unwrap().unwrap(), 12)
+         .unwrap()
+         .unwrap();
+      assert_eq!(text.plain, "hi");
+      assert_eq!(text.inset, Some(10.0));
       assert_eq!(text.vertical_alignment.as_deref(), Some("middle"));
       assert_eq!(text.shrink_to_fit, Some(true));
-      assert_eq!(text.runs.len(), 1);
-      let run = &text.runs[0];
-      assert_eq!((run.start, run.end), (0, 5));
-      assert_eq!(run.font_name.as_deref(), Some("Helvetica-Bold"));
-      assert_eq!(run.font_size, Some(13.5));
-      assert_eq!(run.bold, Some(true));
-      assert_eq!(run.italic, Some(false));
-      assert_eq!(run.underline.as_deref(), Some("single"));
-      assert_eq!(run.strikethrough.as_deref(), Some("double"));
-      assert_eq!(run.paragraph_alignment.as_deref(), Some("center"));
-      assert_eq!(run.writing_direction.as_deref(), Some("rtl"));
-      assert_eq!(run.hyperlink.as_deref(), Some("https://example.test"));
-      assert_eq!(run.list_style.as_deref(), Some("bullet"));
-      assert!(matches!(run.fill, Some(FreeformPaint::Solid { .. })));
+      assert_eq!(text.runs[0].bold, Some(true));
+      assert_eq!((text.runs[0].start, text.runs[0].end), (0, 2));
    }
 
    #[test]
-   fn preserves_table_cell_boundaries_dimensions_and_style() {
-      let text = bytes(1, b"one\ntwo");
-      let fill = color(1.0, 0.0, 0.0, 1.0);
-      let border = [bytes(1, &color(0.0, 0.0, 1.0, 1.0)), float(2, 2.0)].concat();
-      let style = [bytes(1, &fill), bytes(2, &border)].concat();
-      let first = [
-         bytes(1, b"cell-a"),
-         integer(2, 0),
-         integer(3, 0),
-         integer(4, 1),
-         integer(5, 2),
-         bytes(6, &text),
-         bytes(7, &style),
-         bytes(8, b"shape-uuid"),
-      ]
-      .concat();
-      let second = [
-         bytes(1, b"cell-b"),
-         integer(2, 0),
-         integer(3, 2),
-         integer(4, 1),
-         integer(5, 1),
-         bytes(6, &bytes(1, b"three")),
-      ]
-      .concat();
-      let table =
-         [float(1, 72.0), float(1, 144.0), float(2, 28.0), bytes(3, &first), bytes(3, &second)]
-            .concat();
-      let (rows, columns, cells) = decode_table(&record(&table)).unwrap();
-      assert_eq!(columns, [72.0, 144.0]);
-      assert_eq!(rows, [28.0]);
-      assert_eq!(cells[0].text.as_ref().unwrap().plain, "one\ntwo");
-      assert_eq!(cells[1].text.as_ref().unwrap().plain, "three");
-      assert_eq!(
-         (cells[0].row, cells[0].column, cells[0].row_span, cells[0].column_span),
-         (Some(0), Some(0), Some(1), Some(2))
+   fn real_shape_instructional_space_is_not_a_label() {
+      let archive = parse_native_archive(REAL).unwrap();
+      let shape = &archive.objects[0];
+      let document = Document::parse(shape.region("specificCRDTData").unwrap().bytes).unwrap();
+      assert!(
+         decode_text(document.root().unwrap().unwrap(), 3)
+            .unwrap()
+            .is_none()
       );
-      assert_eq!(cells[0].anchored_item_ids, ["shape-uuid"]);
-      assert!(matches!(cells[0].style.fill, Some(FreeformPaint::Solid { .. })));
-      assert!(cells[0].style.stroke.is_some());
+   }
+
+   #[test]
+   fn real_table_preserves_order_sparse_cells_and_native_attributes() {
+      let archive = parse_native_archive(REAL).unwrap();
+      let table = archive
+         .objects
+         .iter()
+         .find(|object| object.region("capsuleData").is_some())
+         .unwrap();
+      let document = Document::parse(table.region("capsuleData").unwrap().bytes).unwrap();
+      let DecodedTable { row_heights, column_widths, cells, style, options } =
+         decode_table(document).unwrap();
+      assert_eq!(row_heights, [353.8125, 258.0]);
+      assert_eq!(column_widths, [344.0, 344.0]);
+      assert!(style.stroke.is_some());
+      assert!(style.fill.is_some());
+      assert_eq!(options.border_options, Some(7));
+      assert_eq!(options.rounded_corners, Some(true));
+      assert_eq!(options.cell_autogrow, Some(true));
+      assert_eq!(cells.len(), 4);
+      assert_eq!(
+         cells[0].id.as_deref(),
+         Some("D8173D6F-4E25-458B-93E2-132B146FDEC8/4C041466-EA06-4A6D-A003-01F7CFDA3AD3")
+      );
+      assert!(cells[3].text.is_none());
+      assert_eq!(
+         cells
+            .iter()
+            .filter(|cell| cell.text.as_ref().is_some_and(|text| text.plain == "aaa"))
+            .count(),
+         3
+      );
+      let styled = cells
+         .iter()
+         .filter_map(|cell| cell.text.as_ref())
+         .flat_map(|text| &text.runs)
+         .find(|run| run.font_size == Some(72.0))
+         .unwrap();
+      assert_eq!(styled.bold, Some(true));
+      assert_eq!(styled.paragraph_alignment.as_deref(), Some("center"));
+      assert_eq!(styled.list_style.as_deref(), Some("bulleted"));
+      assert!(styled.fill.is_some());
+      assert!(
+         cells
+            .iter()
+            .all(|cell| cell.row_span == Some(1) && cell.column_span == Some(1))
+      );
+   }
+
+   #[test]
+   fn utf16_ranges_convert_to_documented_utf8_byte_offsets() {
+      let mut cursor = Utf16Cursor::new("a🦀é");
+      assert_eq!(cursor.advance(1).unwrap(), 1);
+      assert_eq!(cursor.advance(2).unwrap(), 5);
+      assert_eq!(cursor.advance(1).unwrap(), 7);
+      assert!(cursor.advance(1).is_err());
+      assert!(Utf16Cursor::new("🦀").advance(1).is_err());
    }
 }

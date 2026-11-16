@@ -1,0 +1,35 @@
+# Names doc comments use as prose; `..` keeps clippy's built-in list (macOS, …).
+doc-valid-idents = ["FoundationDB", "RaBitQ", "SPFresh", ".."]
+
+disallowed-methods = [
+	{ path = "std::sync::Mutex::new", reason = "use `parking_lot::Mutex::new` instead" },
+	{ path = "std::sync::mpsc::channel", reason = "use `flume::unbounded` instead" },
+	{ path = "std::sync::mpsc::sync_channel", reason = "use `flume::bounded` instead" },
+	# Not dependencies — paths only resolve if the crate sneaks in.
+	{ path = "chrono::Utc::now", reason = "use `jiff::Timestamp::now` instead", allow-invalid = true },
+	{ path = "crossbeam_channel::unbounded", reason = "use `flume::unbounded` instead", allow-invalid = true },
+	{ path = "crossbeam_channel::bounded", reason = "use `flume::bounded` instead", allow-invalid = true },
+]
+
+disallowed-macros = [
+	{ path = "anyhow::anyhow", reason = "use error enums", allow-invalid = true },
+	{ path = "anyhow::bail", reason = "use error enums", allow-invalid = true },
+	{ path = "anyhow::ensure", reason = "use error enums", allow-invalid = true },
+]
+
+disallowed-types = [
+	{ path = "std::sync::Mutex", reason = "use `parking_lot::Mutex` instead" },
+	{ path = "std::sync::MutexGuard", reason = "use `parking_lot::MutexGuard` instead" },
+	{ path = "std::sync::mpsc::Sender", reason = "use `flume::Sender` instead" },
+	{ path = "std::sync::mpsc::SyncSender", reason = "use `flume::Sender` instead" },
+	{ path = "std::sync::mpsc::Receiver", reason = "use `flume::Receiver` instead" },
+
+	# Not dependencies — paths only resolve if the crate sneaks in.
+	{ path = "crossbeam_channel::Sender", reason = "use `flume::Sender` instead", allow-invalid = true },
+	{ path = "crossbeam_channel::Receiver", reason = "use `flume::Receiver` instead", allow-invalid = true },
+	{ path = "anyhow::Error", reason = "use error enums", allow-invalid = true },
+	{ path = "chrono::DateTime", reason = "use `jiff` instead", allow-invalid = true },
+	{ path = "chrono::NaiveDateTime", reason = "use `jiff` instead", allow-invalid = true },
+	{ path = "chrono::Utc", reason = "use `jiff` instead", allow-invalid = true },
+	{ path = "chrono::Local", reason = "use `jiff` instead", allow-invalid = true },
+]

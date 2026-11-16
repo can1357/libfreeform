@@ -382,12 +382,7 @@ impl<'a> Parser<'a> {
             let span = self.object_span(string_at, byte_count)?;
             // Every UTF-16 code unit could encode to three UTF-8 bytes.
             self.charge_bytes(count.checked_mul(3).ok_or(())?)?;
-            let mut units = Vec::new();
-            units.try_reserve_exact(count).map_err(|_| ())?;
-            for bytes in self.b[span].chunks_exact(2) {
-               units.push(u16::from_be_bytes(bytes.try_into().map_err(|_| ())?));
-            }
-            Ok(Plist::String(String::from_utf16(&units).map_err(|_| ())?))
+            Ok(Plist::String(String::from_utf16be(&self.b[span]).map_err(|_| ())?))
          },
          0x80 => {
             let width = info as usize + 1;
@@ -442,7 +437,7 @@ mod tests {
    use super::*;
 
    const TSU: &[u8] = include_bytes!("../fixtures/native-mixed.tsudescription");
-   const CRL: &[u8] = include_bytes!("../fixtures/native-mixed.crlnative");
+   const CRL: &[u8] = include_bytes!("../fixtures/real-board.crlnative");
 
    fn plist(objects: &[&[u8]], top_object: usize) -> Vec<u8> {
       assert!(u8::try_from(objects.len()).is_ok());

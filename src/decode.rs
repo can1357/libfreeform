@@ -5,7 +5,7 @@
 //! stale `TSUDescription` must not be allowed to annotate unrelated native
 //! records.
 
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use super::{
    crl::{decode_crl_native, join_crl_tsu, parse_tsu_description},
@@ -14,6 +14,7 @@ use super::{
       FreeformAsset, FreeformBlobs, FreeformDecodeError, FreeformDiagnostic, FreeformFlavor,
       FreeformItemKind, FreeformNativeMetadata, FreeformPasteboard, FreeformRender, FreeformTier,
    },
+   wire::{Fields, Value},
 };
 
 /// Which recognized Freeform pasteboard flavor a blob carries.
@@ -58,6 +59,9 @@ const PDF_MAGIC: &[u8; 5] = b"%PDF-";
 pub fn classify_blob(name: &str, bytes: &[u8]) -> Option<BlobKind> {
    let name = dump_name(name);
    let normalized = normalize_uti(name);
+   if let Some(kind) = native_chunk_kind(name) {
+      return Some(kind);
+   }
 
    let kind = match normalized.as_str() {
       "comappledrawing" => BlobKind::Drawing,
@@ -92,9 +96,10 @@ pub fn decode_pasteboard(blobs: FreeformBlobs) -> FreeformPasteboard {
    let mut native = None;
    let mut manifest = None;
    let mut metadata = None;
-   let mut asset_flavors = Vec::new();
 
-   for flavor in &blobs.flavors {
+   let (transports, transport_errors) = assemble_transports(&blobs.flavors, Transport::Native);
+   for flavor in &transports {
+      let flavor = flavor.as_ref();
       match classify_blob(&flavor.uti, &flavor.bytes) {
          Some(BlobKind::Drawing) if drawing.is_none() => drawing = Some(flavor),
          Some(BlobKind::CrlNative) if native.is_none() => native = Some(flavor),
@@ -111,7 +116,7 @@ pub fn decode_pasteboard(blobs: FreeformBlobs) -> FreeformPasteboard {
                .state
                .insert(flavor.uti.clone(), flavor.bytes.clone());
          },
-         Some(BlobKind::Asset) => asset_flavors.push(flavor),
+         Some(BlobKind::Asset) => {},
          Some(
             kind @ (BlobKind::Drawing
             | BlobKind::CrlNative
@@ -141,11 +146,48 @@ pub fn decode_pasteboard(blobs: FreeformBlobs) -> FreeformPasteboard {
    pasteboard.native = decode_native(native);
    pasteboard.manifest = decode_manifest(manifest);
    pasteboard.metadata = decode_metadata_tier(metadata);
-   merge_asset_flavors(&mut pasteboard, asset_flavors);
+   for (kind, source, error) in transport_errors {
+      match kind {
+         BlobKind::CrlNative => pasteboard.native = FreeformTier::Failed(error.clone()),
+         BlobKind::CrlNativeMetadata => pasteboard.metadata = FreeformTier::Failed(error.clone()),
+         _ => {},
+      }
+      pasteboard
+         .diagnostics
+         .push(FreeformDiagnostic { source, message: error.message });
+   }
 
    join_manifest(&mut pasteboard);
+   let descriptors = match &pasteboard.native {
+      FreeformTier::Decoded(native) => Some(&native.assets),
+      _ => None,
+   };
+   let (assets, errors) = assemble_transports(&blobs.flavors, Transport::Assets { descriptors });
+   let mut asset_flavors = Vec::new();
+   for asset in &assets {
+      if asset_id(&asset.uti).is_some() {
+         asset_flavors.push(asset.as_ref());
+      }
+   }
+   for (_, source, error) in errors {
+      for flavor in &blobs.flavors {
+         if asset_id(&flavor.uti).is_some_and(|id| {
+            id == source
+               || id
+                  .strip_prefix(&source)
+                  .is_some_and(|tail| tail.starts_with(['.', '_']))
+         }) {
+            pasteboard.unknown_flavors.push(flavor.clone());
+         }
+      }
+      pasteboard
+         .diagnostics
+         .push(FreeformDiagnostic { source, message: error.message });
+   }
+   merge_asset_flavors(&mut pasteboard, asset_flavors);
    correlate_metadata(&mut pasteboard);
    prefer_pk_drawing(&mut pasteboard);
+   pasteboard.flavors = blobs.flavors;
    pasteboard
 }
 
@@ -155,18 +197,184 @@ pub fn decode_pasteboard(blobs: FreeformBlobs) -> FreeformPasteboard {
 /// render counts.  Generic rich/plain text and arbitrary binary plists do not:
 /// neither proves that the producing application was Freeform.
 pub fn has_freeform_content(blobs: &FreeformBlobs) -> bool {
-   blobs
-      .flavors
+   let (flavors, errors) = assemble_transports(&blobs.flavors, Transport::Native);
+   flavors
       .iter()
       .any(|flavor| match classify_blob(&flavor.uti, &flavor.bytes) {
          Some(BlobKind::Drawing) => decode_pk_drawing(&flavor.bytes).is_ok(),
-         Some(BlobKind::CrlNative) => decode_crl_native(&flavor.bytes).is_ok(),
+         Some(BlobKind::CrlNative) => {
+            !errors.iter().any(|(kind, ..)| *kind == BlobKind::CrlNative)
+               && decode_crl_native(&flavor.bytes).is_ok()
+         },
          Some(BlobKind::TsuDescription) => {
             has_bplist_header(&flavor.bytes) && parse_tsu_description(&flavor.bytes).is_ok()
          },
          Some(BlobKind::RenderPng | BlobKind::RenderTiff | BlobKind::RenderPdf) => true,
          _ => false,
       })
+}
+
+type TransportFailure = (BlobKind, String, FreeformDecodeError);
+type AssembledTransports<'a> = (Vec<Cow<'a, FreeformFlavor>>, Vec<TransportFailure>);
+
+enum Transport<'a> {
+   Native,
+   Assets { descriptors: Option<&'a BTreeMap<String, FreeformAsset>> },
+}
+
+/// Reassemble only native numbered transports. The suffix is a canonical,
+/// positive decimal integer; neither lexical order nor input order is
+/// meaningful. Asset IDs themselves may contain numbers, so descriptors must
+/// disambiguate a trailing numeric component from a continuation index.
+fn assemble_transports<'a>(
+   flavors: &'a [FreeformFlavor],
+   transport: Transport<'_>,
+) -> AssembledTransports<'a> {
+   let (assets, descriptors) = match transport {
+      Transport::Native => (false, None),
+      Transport::Assets { descriptors } => (true, descriptors),
+   };
+   let mut groups: BTreeMap<String, Vec<(Option<usize>, &'a FreeformFlavor)>> = BTreeMap::new();
+   let mut output = Vec::new();
+   for flavor in flavors {
+      let name = dump_name(&flavor.uti);
+      let mut target = None;
+      if assets {
+         if let Some(id) = asset_id(name) {
+            let separator = if name
+               .get(..4)
+               .is_some_and(|prefix| prefix.eq_ignore_ascii_case("com_"))
+            {
+               '_'
+            } else {
+               '.'
+            };
+            let suffix = id
+               .rsplit_once(separator)
+               .filter(|(_, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()));
+            if let Some((base, tail)) = suffix {
+               let exact = descriptors.is_some_and(|map| map.contains_key(id));
+               let parent = descriptors.is_some_and(|map| map.contains_key(base));
+               if exact && !parent {
+                  target = Some((id.to_owned(), Some(0)));
+               } else {
+                  // Without a descriptor, even an apparent base flavor cannot
+                  // prove that "id.1" is not an independent asset identifier.
+                  target = Some((
+                     base.to_owned(),
+                     if parent && !exact {
+                        chunk_index(tail)
+                     } else {
+                        None
+                     },
+                  ));
+               }
+            } else {
+               target = Some((id.to_owned(), Some(0)));
+            }
+         }
+      } else {
+         for (uti, alias) in [
+            ("com.apple.freeform.CRLNativeData", "com_apple_freeform_CRLNativeData"),
+            ("com.apple.freeform.CRLNativeMetadata", "com_apple_freeform_CRLNativeMetadata"),
+         ] {
+            for (base, separator) in [(uti, '.'), (alias, '_')] {
+               if name.eq_ignore_ascii_case(base) {
+                  target = Some((uti.to_owned(), Some(0)));
+               } else if name.len() > base.len()
+                  && name
+                     .get(..base.len())
+                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case(base))
+                  && name.as_bytes()[base.len()] == separator as u8
+               {
+                  let tail = &name[base.len() + 1..];
+                  if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+                     target = Some((uti.to_owned(), chunk_index(tail)));
+                  }
+               }
+            }
+         }
+      }
+      if let Some((key, index)) = target {
+         groups.entry(key).or_default().push((index, flavor));
+      } else if !assets {
+         output.push(Cow::Borrowed(flavor));
+      }
+   }
+   let mut errors = Vec::new();
+   for (key, mut chunks) in groups {
+      let kind = if assets {
+         BlobKind::Asset
+      } else if key.ends_with("Metadata") {
+         BlobKind::CrlNativeMetadata
+      } else {
+         BlobKind::CrlNative
+      };
+      chunks.sort_by_key(|(index, _)| *index);
+      let ambiguous = chunks.iter().any(|(index, _)| index.is_none())
+         || chunks.windows(2).any(|pair| pair[0].0 == pair[1].0);
+      let missing = chunks
+         .iter()
+         .enumerate()
+         .any(|(expected, (index, _))| *index != Some(expected));
+      if ambiguous || missing {
+         let message = format!(
+            "{key}: {}",
+            if ambiguous {
+               "ambiguous or duplicate numbered transport"
+            } else {
+               "missing numbered transport chunk"
+            }
+         );
+         let error = if ambiguous {
+            FreeformDecodeError::invalid(message)
+         } else {
+            FreeformDecodeError::incomplete(message)
+         };
+         errors.push((kind, key, error));
+         if !assets {
+            output.extend(chunks.into_iter().map(|(_, flavor)| Cow::Borrowed(flavor)));
+         }
+         continue;
+      }
+      if chunks.len() == 1 {
+         output.push(Cow::Borrowed(chunks[0].1));
+      } else {
+         let mut bytes =
+            Vec::with_capacity(chunks.iter().map(|(_, flavor)| flavor.bytes.len()).sum());
+         for (_, flavor) in &chunks {
+            bytes.extend_from_slice(&flavor.bytes);
+         }
+         output.push(Cow::Owned(FreeformFlavor { uti: chunks[0].1.uti.clone(), bytes }));
+      }
+   }
+   (output, errors)
+}
+
+fn native_chunk_kind(name: &str) -> Option<BlobKind> {
+   for (prefix, separator, kind) in [
+      ("com.apple.freeform.CRLNativeData", '.', BlobKind::CrlNative),
+      ("com_apple_freeform_CRLNativeData", '_', BlobKind::CrlNative),
+      ("com.apple.freeform.CRLNativeMetadata", '.', BlobKind::CrlNativeMetadata),
+      ("com_apple_freeform_CRLNativeMetadata", '_', BlobKind::CrlNativeMetadata),
+   ] {
+      if name
+         .get(..prefix.len())
+         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+         && name.as_bytes().get(prefix.len()) == Some(&(separator as u8))
+         && chunk_index(&name[prefix.len() + 1..]).is_some()
+      {
+         return Some(kind);
+      }
+   }
+   None
+}
+
+fn chunk_index(tail: &str) -> Option<usize> {
+   if tail.starts_with('0') {
+      return None;
+   }
+   tail.parse().ok().filter(|index| *index > 0)
 }
 
 fn decode_drawing(flavor: Option<&FreeformFlavor>) -> FreeformTier<super::types::FreeformDrawing> {
@@ -304,7 +512,9 @@ fn add_asset(
       });
       return;
    }
-   asset.uti = Some(flavor.uti.clone());
+   if asset.uti.is_none() {
+      asset.uti = Some(flavor.uti.clone());
+   }
    asset.bytes = Some(flavor.bytes.clone());
 }
 
@@ -326,86 +536,21 @@ fn decode_native_metadata(bytes: &[u8]) -> Result<FreeformNativeMetadata, Freefo
       return Err(FreeformDecodeError::invalid("CRLNativeMetadata: bytes follow declared payload"));
    }
 
+   // Schema-free: any top-level 16-byte length-delimited field is a candidate
+   // paste UUID.
    let mut ids = Vec::new();
-   walk_protobuf(payload, &mut |field, value| {
-      if field != 0 && value.len() == 16 {
+   for field in Fields::new(payload) {
+      if let Value::Bytes(value) = field?.value
+         && value.len() == 16
+      {
          let id = format_uuid(value);
          if !ids.contains(&id) {
             ids.push(id);
          }
       }
-      Ok(())
-   })?;
+   }
    let paste_id = (ids.len() == 1).then(|| ids.remove(0));
    Ok(FreeformNativeMetadata { paste_id, raw_data: payload.to_vec() })
-}
-
-fn walk_protobuf(
-   bytes: &[u8],
-   visit: &mut impl FnMut(u64, &[u8]) -> Result<(), FreeformDecodeError>,
-) -> Result<(), FreeformDecodeError> {
-   let mut at = 0;
-   while at < bytes.len() {
-      let (tag, next) = read_varint(bytes, at)?;
-      at = next;
-      let field = tag >> 3;
-      if field == 0 {
-         return Err(FreeformDecodeError::invalid("CRLNativeMetadata: protobuf field zero"));
-      }
-      match tag & 7 {
-         0 => at = read_varint(bytes, at)?.1,
-         1 => {
-            at = at
-               .checked_add(8)
-               .filter(|end| *end <= bytes.len())
-               .ok_or_else(|| {
-                  FreeformDecodeError::incomplete("CRLNativeMetadata: truncated fixed64")
-               })?;
-         },
-         2 => {
-            let (length, next) = read_varint(bytes, at)?;
-            let length = usize::try_from(length).map_err(|_| {
-               FreeformDecodeError::invalid("CRLNativeMetadata: protobuf length exceeds platform")
-            })?;
-            let end = next
-               .checked_add(length)
-               .filter(|end| *end <= bytes.len())
-               .ok_or_else(|| {
-                  FreeformDecodeError::incomplete("CRLNativeMetadata: truncated protobuf field")
-               })?;
-            visit(field, &bytes[next..end])?;
-            at = end;
-         },
-         5 => {
-            at = at
-               .checked_add(4)
-               .filter(|end| *end <= bytes.len())
-               .ok_or_else(|| {
-                  FreeformDecodeError::incomplete("CRLNativeMetadata: truncated fixed32")
-               })?;
-         },
-         _ => return Err(FreeformDecodeError::invalid("CRLNativeMetadata: unsupported wire type")),
-      }
-   }
-   Ok(())
-}
-
-fn read_varint(bytes: &[u8], mut at: usize) -> Result<(u64, usize), FreeformDecodeError> {
-   let mut value = 0u64;
-   for index in 0..10 {
-      let byte = *bytes
-         .get(at)
-         .ok_or_else(|| FreeformDecodeError::incomplete("CRLNativeMetadata: truncated varint"))?;
-      at += 1;
-      if index == 9 && byte > 1 {
-         return Err(FreeformDecodeError::invalid("CRLNativeMetadata: overlong varint"));
-      }
-      value |= u64::from(byte & 0x7f) << (index * 7);
-      if byte & 0x80 == 0 {
-         return Ok((value, at));
-      }
-   }
-   Err(FreeformDecodeError::invalid("CRLNativeMetadata: overlong varint"))
 }
 
 fn format_uuid(bytes: &[u8]) -> String {
@@ -497,8 +642,8 @@ mod tests {
    use super::*;
 
    const DRAWING: &[u8] = include_bytes!("../fixtures/ink-pen.drawing");
-   const NATIVE: &[u8] = include_bytes!("../fixtures/native-mixed.crlnative");
-   const TSU: &[u8] = include_bytes!("../fixtures/native-mixed.tsudescription");
+   const NATIVE: &[u8] = include_bytes!("../fixtures/real-board.crlnative");
+   const TSU: &[u8] = include_bytes!("../fixtures/real-board.tsudescription");
 
    fn flavor(uti: &str, bytes: &[u8]) -> FreeformFlavor {
       FreeformFlavor { uti: uti.into(), bytes: bytes.into() }
@@ -652,6 +797,147 @@ mod tests {
             .iter()
             .any(|d| d.message.contains("does not match"))
       );
+   }
+
+   #[test]
+   fn unordered_native_chunks_reassemble_real_capture() {
+      let mut flavors: Vec<_> = NATIVE
+         .chunks(1024)
+         .enumerate()
+         .map(|(index, bytes)| {
+            let name = if index == 0 {
+               "com.apple.freeform.CRLNativeData".to_owned()
+            } else {
+               format!("com.apple.freeform.CRLNativeData.{index}")
+            };
+            flavor(&name, bytes)
+         })
+         .collect();
+      flavors.reverse();
+      let blobs = FreeformBlobs { flavors: flavors.clone(), ..FreeformBlobs::default() };
+      assert!(has_freeform_content(&blobs));
+      let decoded = decode_pasteboard(blobs);
+      assert_eq!(decoded.flavors, flavors);
+      assert_eq!(decoded.native, FreeformTier::Decoded(decode_crl_native(NATIVE).unwrap()));
+      assert!(decoded.unknown_flavors.is_empty());
+   }
+
+   #[test]
+   fn missing_and_duplicate_chunks_fail_only_native_transport() {
+      for chunks in [
+         vec![flavor("com.apple.freeform.CRLNativeData.2", b"tail")],
+         vec![
+            flavor("com.apple.freeform.CRLNativeData.1", b"a"),
+            flavor("com_apple_freeform_CRLNativeData_1.bin", b"b"),
+         ],
+         vec![flavor("com.apple.freeform.CRLNativeData.01", b"a")],
+      ] {
+         let mut flavors = vec![
+            flavor("com.apple.freeform.CRLNativeData", NATIVE),
+            flavor("com.apple.freeform.TSUDescription", TSU),
+            flavor("public.png", b"\x89PNG\r\n\x1a\nrender"),
+         ];
+         flavors.extend(chunks);
+         let decoded =
+            decode_pasteboard(FreeformBlobs { flavors: flavors.clone(), ..Default::default() });
+         assert!(matches!(decoded.native, FreeformTier::Failed(_)));
+         assert!(matches!(decoded.manifest, FreeformTier::Decoded(_)));
+         assert_eq!(decoded.renders.len(), 1);
+         assert_eq!(decoded.flavors, flavors);
+      }
+   }
+
+   #[test]
+   fn metadata_chunks_use_dump_aliases_and_fail_independently() {
+      let metadata = 0u64.to_le_bytes();
+      let decoded = decode_pasteboard(FreeformBlobs {
+         flavors: vec![
+            flavor("com_apple_freeform_CRLNativeMetadata_1.bin", &metadata[4..]),
+            flavor("com_apple_freeform_CRLNativeMetadata.bin", &metadata[..4]),
+            flavor("com.apple.freeform.CRLNativeData", b"bad"),
+         ],
+         ..Default::default()
+      });
+      assert!(matches!(decoded.metadata, FreeformTier::Decoded(_)));
+      assert!(matches!(decoded.native, FreeformTier::Failed(_)));
+   }
+
+   #[test]
+   fn asset_chunks_require_exact_descriptor_identity() {
+      let descriptor = FreeformAsset {
+         id:             "123".into(),
+         filename:       Some("image.png".into()),
+         uti:            Some("public.png".into()),
+         bytes:          None,
+         premium:        None,
+         intrinsic_size: None,
+         raw_descriptor: vec![42],
+      };
+      let mut descriptors = BTreeMap::from([("123".into(), descriptor.clone())]);
+      let flavors = vec![
+         flavor("com.apple.freeform.CRLAsset.123.1", b"second"),
+         flavor("com.apple.freeform.CRLAsset.123", b"first"),
+      ];
+      let (joined, errors) =
+         assemble_transports(&flavors, Transport::Assets { descriptors: Some(&descriptors) });
+      assert!(errors.is_empty());
+      assert_eq!(joined.len(), 1);
+      let mut diagnostics = Vec::new();
+      add_asset(&mut descriptors, &joined[0], &mut diagnostics);
+      assert_eq!(descriptors["123"].bytes.as_deref(), Some(&b"firstsecond"[..]));
+      assert_eq!(descriptors["123"].uti.as_deref(), Some("public.png"));
+      assert_eq!(descriptors["123"].raw_descriptor, vec![42]);
+
+      let (joined, errors) = assemble_transports(&flavors, Transport::Assets { descriptors: None });
+      assert!(joined.is_empty());
+      assert_eq!(errors.len(), 1);
+
+      for bad in [
+         vec![
+            flavor("com.apple.freeform.CRLAsset.123", b"first"),
+            flavor("com.apple.freeform.CRLAsset.123.2", b"third"),
+         ],
+         vec![
+            flavor("com.apple.freeform.CRLAsset.123", b"first"),
+            flavor("com.apple.freeform.CRLAsset.123.1", b"second"),
+            flavor("com_apple_freeform_CRLAsset_123_1.bin", b"duplicate"),
+         ],
+      ] {
+         let (joined, errors) =
+            assemble_transports(&bad, Transport::Assets { descriptors: Some(&descriptors) });
+         assert!(joined.is_empty());
+         assert_eq!(errors.len(), 1);
+      }
+
+      descriptors.insert("123.1".into(), FreeformAsset { id: "123.1".into(), ..descriptor });
+      let (joined, errors) =
+         assemble_transports(&flavors, Transport::Assets { descriptors: Some(&descriptors) });
+      assert!(joined.is_empty());
+      assert_eq!(errors.len(), 1);
+   }
+
+   #[test]
+   fn numeric_asset_ids_are_not_inferred_as_chunks() {
+      let decoded = decode_pasteboard(FreeformBlobs {
+         flavors: vec![flavor("com.apple.freeform.CRLAsset.123", b"numeric asset")],
+         ..Default::default()
+      });
+      assert_eq!(decoded.assets["123"].bytes.as_deref(), Some(&b"numeric asset"[..]));
+      let descriptor = FreeformAsset {
+         id:             "123.1".into(),
+         filename:       None,
+         uti:            None,
+         bytes:          None,
+         premium:        None,
+         intrinsic_size: None,
+         raw_descriptor: Vec::new(),
+      };
+      let descriptors = BTreeMap::from([("123.1".into(), descriptor)]);
+      let flavors = vec![flavor("com.apple.freeform.CRLAsset.123.1", b"exact asset")];
+      let (joined, errors) =
+         assemble_transports(&flavors, Transport::Assets { descriptors: Some(&descriptors) });
+      assert!(errors.is_empty());
+      assert_eq!(joined[0].bytes, b"exact asset");
    }
 
    #[test]

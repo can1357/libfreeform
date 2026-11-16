@@ -78,3 +78,11 @@ pub fn decode_pasteboard(blobs: JsValue) -> Result<JsValue, JsValue> {
       .map_err(|error| decode_error(crate::FreeformDecodeError::invalid(error.to_string())))?;
    to_js(&crate::decode_pasteboard(blobs))
 }
+
+/// Checks importable content using the same transport assembly and validation
+/// as native callers.
+#[wasm_bindgen(js_name = hasFreeformContent)]
+pub fn has_freeform_content(blobs: JsValue) -> bool {
+   serde_wasm_bindgen::from_value::<crate::FreeformBlobs>(blobs)
+      .is_ok_and(|blobs| crate::has_freeform_content(&blobs))
+}

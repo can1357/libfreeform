@@ -10,14 +10,20 @@ Freeform writes one selection in several parallel pasteboard flavors. This libra
 
 | Pasteboard flavor | Decoded data |
 |---|---|
-| `com.apple.drawing` | PencilKit spline controls, full affine transforms, proven point channels, exact ink identifiers, and raw stroke records |
-| `com.apple.freeform.CRLNativeData` | Typed, record-bounded board items: geometry/style, shapes, text, connectors, tables, media, groups, and native ink |
+| `com.apple.drawing` | Mask-driven spline controls and point channels, affine transforms, archived render bounds, ink identifiers, erased/masked strokes with visible ranges and mask polygons, and raw stroke records |
+| `com.apple.freeform.CRLNativeData` | Directory-bounded object trees: geometry/styles, labeled shapes, text, connectors, table capsules and cell anchors, media, groups, and native ink |
 | `com.apple.freeform.TSUDescription` | Ordered item classes and recursive routing hints |
 | `CRLNativeMetadata`, `CRLAsset.*`, state/style/text/render flavors | Correlation metadata, embedded assets, state flags, style/text selections, and PNG/TIFF/PDF fallbacks |
 
 `decodePasteboard` returns a `decoded`, `failed`, or `absent` outcome for each independent tier. A damaged TSU manifest cannot discard valid native data; mismatched tiers are reported instead of partially joined. Private CRL formats remain OS-version fragile, so unsupported fields retain their bounded raw records rather than receiving guessed values. The wire formats are documented in [`docs/FORMAT.md`](docs/FORMAT.md).
 
+Native decoding uses Freeform's object directories and Coherence schemas, not byte-pattern scans. Numbered native/metadata/asset chunks are assembled before decoding; original ordered flavors remain available. Native kinds decode without TSU, which independently supplies routing hints such as text-box classification.
+
+Nested objects are exposed through `children`; named `recordRanges` index exact payloads in `rawArchive`. Colors preserve their native RGB/CMYK/monochrome model rather than inventing an sRGB conversion. Parametric paths retain source controls. These are importable native values, not a replacement for Freeform's renderer; unsupported kinds/fields retain raw data.
+
 ## Rust
+
+Requires Rust 1.98 or newer.
 
 ```sh
 cargo add libfreeform

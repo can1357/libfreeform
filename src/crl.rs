@@ -1,29 +1,28 @@
 //! CRL native-archive integration.
 //!
-//! The envelope parser establishes record boundaries. This module never scans
-//! the archive globally or associates values by byte distance: item decoders
-//! receive only the record that owns the item. A TSU description is decoded and
-//! joined separately so an invalid optional manifest cannot discard native
-//! data.
+//! Explicit object directories establish ownership, boundaries, and native
+//! kinds. Common, specific, and capsule payloads are decoded together; TSU
+//! independently adds routing hints without replacing the native object graph.
 
 mod assets;
+mod coherence;
 mod connector;
 mod envelope;
 mod native_ink;
 mod shape;
 mod text_table;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
-use envelope::{NativeArchive, NativeRecord, parse_native_archive};
+use coherence::{Document, Node};
+use envelope::{NativeArchive, NativeObject, parse_native_archive};
 
 pub use super::types::TsuEntry;
 use super::{
    bplist::{Plist, parse_bplist},
    types::{
-      FreeformAsset, FreeformBoardItem, FreeformConnectorEndpoint, FreeformDecodeError,
-      FreeformGeometry, FreeformItemKind, FreeformNative, FreeformRecordRange, FreeformStyle,
-      TsuValue,
+      FreeformAsset, FreeformBoardItem, FreeformDecodeError, FreeformItemKind, FreeformNative,
+      FreeformRecordRange, FreeformTableAnchor, TsuValue,
    },
 };
 
@@ -104,65 +103,301 @@ fn tsu_value(value: &Plist) -> Result<TsuValue, FreeformDecodeError> {
    }
 }
 
-/// Decodes the self-contained `CRLNativeData` tier without requiring TSU.
+/// Decodes native kinds and their complete named payloads without requiring
+/// TSU.
 ///
-/// Returned items retain every exact bounded owner-record range in
-/// [`FreeformNative::raw_archive`]. `raw_data` remains the primary common
-/// record for schema-bounded dispatch. Without a TSU routing manifest items
-/// are deliberately `Unknown`; use [`join_crl_tsu`] only after the independent
-/// TSU tier has decoded successfully.
+/// Malformed or truncated known records fail explicitly. Unsupported item kinds
+/// retain their native discriminator and exact directory ranges.
 pub fn decode_crl_native(data: &[u8]) -> Result<FreeformNative, FreeformDecodeError> {
    let archive = parse_native_archive(data)?;
-   Ok(native_from_archive(&archive))
+   native_from_archive(&archive)
 }
 
-fn native_from_archive(archive: &NativeArchive<'_>) -> FreeformNative {
+fn native_from_archive(archive: &NativeArchive<'_>) -> Result<FreeformNative, FreeformDecodeError> {
+   let objects = archive
+      .objects
+      .iter()
+      .map(|object| (object.id.as_str(), object))
+      .collect::<BTreeMap<_, _>>();
+   let mut assets = BTreeMap::new();
    let items = archive
       .item_ids
       .iter()
       .enumerate()
-      .map(|(index, uuid)| board_item_from_records(index, uuid, archive.records(uuid).collect()))
-      .collect();
-
-   FreeformNative {
+      .map(|(index, id)| {
+         let object = objects.get(id.as_str()).ok_or_else(|| {
+            FreeformDecodeError::correlation(format!("native index references missing object {id}"))
+         })?;
+         decode_object(index, object, &objects, &mut assets)
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+   validate_references(&items)?;
+   Ok(FreeformNative {
       paste_id: archive.paste_id.clone(),
       compatibility: archive.compatibility.clone(),
       items,
-      assets: BTreeMap::new(),
+      assets,
       raw_manifest: archive.manifest.to_vec(),
       raw_index: archive.raw_index.to_vec(),
       raw_archive: archive.archive.to_vec(),
-   }
+   })
 }
 
-fn board_item_from_records(
+fn root<'a>(
+   object: &NativeObject<'a>,
+   name: &str,
+) -> Result<Option<Node<'a>>, FreeformDecodeError> {
+   object
+      .region(name)
+      .map(|region| Document::parse(region.bytes)?.root())
+      .transpose()
+      .map(Option::flatten)
+}
+
+fn decode_object(
    index: usize,
-   uuid: &str,
-   records: Vec<&NativeRecord<'_>>,
-) -> FreeformBoardItem {
-   let record_ranges = records
+   object: &NativeObject<'_>,
+   objects: &BTreeMap<&str, &NativeObject<'_>>,
+   assets: &mut BTreeMap<String, FreeformAsset>,
+) -> Result<FreeformBoardItem, FreeformDecodeError> {
+   let common = root(object, "commonCRDTData")?;
+   let specific = root(object, "specificCRDTData")?;
+   if let Some(common) = common
+      && let Some(id) = common
+         .property("a")?
+         .map(|value| value.uuid())
+         .transpose()?
+         .flatten()
+      && id != object.id
+   {
+      return Err(FreeformDecodeError::correlation(format!(
+         "object reference {} disagrees with common CRDT identity {id}",
+         object.id
+      )));
+   }
+   let shape::DecodedShape { preset, path, geometry, mut style } = common
+      .map(|common| shape::decode_shape(common, specific, object.persistence_type))
+      .transpose()?
+      .unwrap_or_else(|| shape::DecodedShape {
+         preset:   None,
+         path:     None,
+         geometry: Default::default(),
+         style:    Default::default(),
+      });
+   let mut kind = if let Some(common) = common {
+      match object.persistence_type {
+         3 => FreeformItemKind::Shape {
+            preset,
+            path,
+            text: specific
+               .map(|specific| text_table::decode_text(specific, object.persistence_type))
+               .transpose()?
+               .flatten(),
+         },
+         12 => FreeformItemKind::StickyNote {
+            text: specific
+               .map(|specific| text_table::decode_text(specific, object.persistence_type))
+               .transpose()?
+               .flatten(),
+         },
+         2 if object.persistence_subtype == Some(1) => {
+            let capsule = object.region("capsuleData").ok_or_else(|| {
+               FreeformDecodeError::invalid("native table has no capsuleData payload")
+            })?;
+            let table = text_table::decode_table(Document::parse(capsule.bytes)?)?;
+            style.fill = table.style.fill;
+            style.stroke = table.style.stroke;
+            FreeformItemKind::Table {
+               row_heights:   table.row_heights,
+               column_widths: table.column_widths,
+               cells:         table.cells,
+               options:       table.options,
+            }
+         },
+         4 => {
+            let specific = specific
+               .ok_or_else(|| FreeformDecodeError::invalid("connector has no specificCRDTData"))?;
+            let (tail, head, routing, path) = connector::decode_connector(common, specific)?;
+            FreeformItemKind::Connector { tail, head, routing, path }
+         },
+         2 if object.persistence_subtype.unwrap_or(0) == 0 => {
+            let specific = specific
+               .ok_or_else(|| FreeformDecodeError::invalid("group has no specificCRDTData"))?;
+            FreeformItemKind::Group {
+               child_ids:         connector::decode_group(specific)?,
+               counter_transform: None,
+            }
+         },
+         5..=9 => {
+            let specific = specific
+               .ok_or_else(|| FreeformDecodeError::invalid("media has no specificCRDTData"))?;
+            let (kind, descriptors) =
+               assets::decode_media(common, specific, object.persistence_type)?;
+            for asset in descriptors {
+               match assets.entry(asset.id.clone()) {
+                  Entry::Vacant(entry) => {
+                     entry.insert(asset);
+                  },
+                  Entry::Occupied(entry) if entry.get() == &asset => {},
+                  Entry::Occupied(_) => {
+                     return Err(FreeformDecodeError::correlation(
+                        "conflicting native asset descriptors share an identifier",
+                     ));
+                  },
+               }
+            }
+            kind
+         },
+         10 => {
+            let container = specific
+               .map(|specific| specific.field("a"))
+               .transpose()?
+               .flatten()
+               .ok_or_else(|| {
+                  FreeformDecodeError::invalid("native ink container has no containerCRDTData")
+               })?;
+            FreeformItemKind::Group {
+               child_ids:         connector::decode_group(container)?,
+               counter_transform: None,
+            }
+         },
+         11 => {
+            let specific = specific
+               .ok_or_else(|| FreeformDecodeError::invalid("native ink has no specificCRDTData"))?;
+            let strokes = native_ink::decode_native_ink(common, specific)?;
+            if strokes.is_empty() {
+               FreeformItemKind::Shape { preset, path, text: None }
+            } else {
+               FreeformItemKind::Ink { strokes }
+            }
+         },
+         _ => FreeformItemKind::Unknown,
+      }
+   } else {
+      FreeformItemKind::Unknown
+   };
+   let children = object
+      .children
       .iter()
-      .map(|record| FreeformRecordRange { offset: record.offset, length: record.bytes.len() })
-      .collect();
-   let raw_data = records
-      .first()
-      .map_or_else(Vec::new, |record| record.bytes.to_vec());
-   FreeformBoardItem {
+      .enumerate()
+      .map(|(index, id)| {
+         let child = objects.get(id.as_str()).ok_or_else(|| {
+            FreeformDecodeError::correlation(format!(
+               "object {} references missing child {id}",
+               object.id
+            ))
+         })?;
+         decode_object(index, child, objects, assets)
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+   if let FreeformItemKind::Table { cells, .. } = &mut kind {
+      for child in &children {
+         if let Some(anchor) = &child.table_anchor {
+            let cell = cells
+               .iter_mut()
+               .find(|cell| cell.id.as_deref() == Some(anchor.cell_id.as_str()))
+               .ok_or_else(|| {
+                  FreeformDecodeError::correlation(format!(
+                     "table child {} references missing cell {}",
+                     child.uuid, anchor.cell_id
+                  ))
+               })?;
+            cell.anchored_item_ids.push(child.uuid.clone());
+         }
+      }
+   }
+   let table_anchor = common
+      .map(|common| table_anchor(common, object.persistence_type))
+      .transpose()?
+      .flatten();
+   Ok(FreeformBoardItem {
       index,
-      uuid: uuid.to_owned(),
-      parent_id: None,
-      class_name: None,
+      uuid: object.id.clone(),
+      parent_id: object.parent_id.clone(),
+      table_anchor,
+      persistence_type: object.persistence_type,
+      persistence_subtype: object.persistence_subtype,
+      class_name: class_name(object.persistence_type, object.persistence_subtype)
+         .map(str::to_owned),
       hints: BTreeMap::new(),
-      geometry: FreeformGeometry::default(),
-      style: FreeformStyle::default(),
-      kind: FreeformItemKind::Unknown,
-      record_ranges,
-      raw_data,
+      geometry,
+      style,
+      kind,
+      children,
+      record_ranges: object
+         .regions
+         .iter()
+         .map(|region| FreeformRecordRange {
+            name:   region.name.to_owned(),
+            offset: region.offset,
+            length: region.bytes.len(),
+         })
+         .collect(),
+   })
+}
+
+fn table_anchor(
+   common: Node<'_>,
+   persistence_type: u32,
+) -> Result<Option<FreeformTableAnchor>, FreeformDecodeError> {
+   let Some(affinity) = common.property("b")? else {
+      return Ok(None);
+   };
+   let affinity = if matches!(persistence_type, 3 | 4 | 11 | 12) {
+      let Some(affinity) = affinity.field(0)? else {
+         return Ok(None);
+      };
+      affinity
+   } else {
+      affinity
+   };
+   let Some(hint) = affinity.field(3)? else {
+      return Ok(None);
+   };
+   let Some(cell) = hint.field(0)? else {
+      return Ok(None);
+   };
+   let row = cell
+      .field(0)?
+      .map(|value| value.uuid())
+      .transpose()?
+      .flatten()
+      .ok_or_else(|| FreeformDecodeError::invalid("table anchor has no row UUID"))?;
+   let column = cell
+      .field(1)?
+      .map(|value| value.uuid())
+      .transpose()?
+      .flatten()
+      .ok_or_else(|| FreeformDecodeError::invalid("table anchor has no column UUID"))?;
+   let geometry = hint
+      .field(1)?
+      .ok_or_else(|| FreeformDecodeError::invalid("table anchor has no cell geometry"))?;
+   Ok(Some(FreeformTableAnchor {
+      cell_id:  format!("{row}/{column}"),
+      geometry: shape::geometry(geometry)?,
+   }))
+}
+
+fn class_name(persistence_type: u32, subtype: Option<u32>) -> Option<&'static str> {
+   match persistence_type {
+      2 if subtype.unwrap_or(0) == 0 => Some("CRLGroupItem"),
+      2 if subtype == Some(1) => Some("CRLTableItem"),
+      3 => Some("CRLWPShapeItem"),
+      4 => Some("CRLConnectionLineItem"),
+      5 => Some("CRLImageItem"),
+      6 => Some("CRLMovieItem"),
+      7 => Some("CRLFileItem"),
+      8 => Some("CRLURLItem"),
+      9 => Some("CRLUsdzItem"),
+      10 => Some("CRLFreehandDrawingItem"),
+      11 => Some("CRLFreehandDrawingShapeItem"),
+      12 => Some("CRLWPStickyNoteItem"),
+      _ => None,
    }
 }
 
 /// Correlates a successfully decoded native tier with a successfully decoded
-/// TSU tier and dispatches class-specific, record-bounded decoders.
+/// TSU tier, preserving already decoded native kinds and nested children.
 ///
 /// Correlation is positional because both formats define an ordered top-level
 /// board-item list. A cardinality mismatch is never guessed or partially
@@ -179,278 +414,140 @@ pub fn join_crl_tsu(
       )));
    }
 
-   let item_ids = native
-      .items
-      .iter()
-      .map(|item| item.uuid.clone())
-      .collect::<Vec<_>>();
    for (item, entry) in native.items.iter_mut().zip(entries) {
+      if let Some(native_class) = item.class_name.as_deref()
+         && native_class != entry.class_name
+      {
+         return Err(FreeformDecodeError::correlation(format!(
+            "native object {} is {native_class}, not {}",
+            item.uuid, entry.class_name
+         )));
+      }
       item.class_name = Some(entry.class_name.clone());
       item.hints = entry.hints.clone();
-      if item.raw_data.is_empty() {
-         continue;
+      if matches!(entry.hints.get("textbox"), Some(TsuValue::Bool(true)))
+         && let FreeformItemKind::Shape { text, .. } = &mut item.kind
+      {
+         item.kind = FreeformItemKind::TextBox { text: text.take() };
       }
-      let raw_data = std::mem::take(&mut item.raw_data);
-      let record = NativeRecord { owner_id: item.uuid.clone(), offset: 0, bytes: &raw_data };
-      let decoded = apply_class_decoder(item, &entry.class_name, &record, &item_ids);
-      item.raw_data = raw_data;
-      let asset = match decoded {
-         Ok(asset) => asset,
-         Err(error) if error.kind == super::types::FreeformDecodeErrorKind::CorrelationMismatch => {
-            return Err(error);
-         },
-         Err(_) => continue,
-      };
-      if let Some(asset) = asset {
-         if native.assets.insert(asset.id.clone(), asset).is_some() {
-            return Err(FreeformDecodeError::correlation(
-               "multiple native asset descriptors share an identifier",
-            ));
+      if let Some(TsuValue::Bool(premium)) = entry.hints.get("containsPremiumContent") {
+         let asset_id = match &item.kind {
+            FreeformItemKind::Image { asset_id, .. }
+            | FreeformItemKind::Media { asset_id, .. }
+            | FreeformItemKind::File { asset_id, .. }
+            | FreeformItemKind::Usdz { asset_id, .. } => asset_id.as_deref(),
+            _ => None,
+         };
+         if let Some(asset) = asset_id.and_then(|id| native.assets.get_mut(id)) {
+            asset.premium = Some(*premium);
          }
       }
    }
-   apply_parent_ids(&mut native.items)?;
-
    Ok(native)
 }
 
-fn apply_class_decoder(
-   item: &mut FreeformBoardItem,
-   class_name: &str,
-   record: &NativeRecord<'_>,
-   item_ids: &[String],
-) -> Result<Option<FreeformAsset>, FreeformDecodeError> {
-   let common = shape::decode_shape(record).ok();
-   if let Some((_, _, geometry, style)) = &common {
-      item.geometry = geometry.clone();
-      item.style = style.clone();
-   }
-
-   match class_name {
-      "CRLWPShapeItem" | "CRLShapeItem" => {
-         let (preset, path) = common.map_or((None, None), |(preset, path, ..)| (preset, path));
-         item.kind = FreeformItemKind::Shape { preset, path };
-      },
-      "CRLWPTextBoxItem" | "CRLTextBoxItem" => {
-         item.kind = FreeformItemKind::TextBox { text: text_table::decode_text(record).ok() };
-      },
-      "CRLWPStickyNoteItem" | "CRLStickyNoteItem" => {
-         item.kind = FreeformItemKind::StickyNote { text: text_table::decode_text(record).ok() };
-      },
-      "CRLWPTableItem" | "CRLTableItem" => {
-         let (row_heights, column_widths, cells) =
-            text_table::decode_table(record).unwrap_or_default();
-         item.kind = FreeformItemKind::Table { row_heights, column_widths, cells };
-      },
-      "CRLConnectionLineItem" | "CRLConnectorItem" => {
-         let (tail, head, routing, path, horizontal_flip, vertical_flip) =
-            connector::decode_connector(record)?;
-         validate_connector_references(&tail, &head, item_ids)?;
-         item.geometry.horizontal_flip = horizontal_flip;
-         item.geometry.vertical_flip = vertical_flip;
-         item.kind = FreeformItemKind::Connector { tail, head, routing, path };
-      },
-      "CRLGroupItem" => {
-         let (child_ids, counter_transform) = connector::decode_group(record)?;
-         validate_group_references(&child_ids, item_ids)?;
-         item.kind = FreeformItemKind::Group { child_ids, counter_transform };
-      },
-      "CRLInkItem" | "CRLNativeInkItem" | "CRLFreehandDrawingItem" => {
-         item.kind = FreeformItemKind::Ink { strokes: native_ink::decode_native_ink(record)? };
-      },
-      "CRLImageItem" => {
-         let asset = assets::decode_asset(record);
-         item.kind = match assets::decode_media(record) {
-            FreeformItemKind::Image { asset_id, crop, mask } => {
-               FreeformItemKind::Image { asset_id, crop, mask }
-            },
-            _ => FreeformItemKind::Image { asset_id: None, crop: None, mask: None },
-         };
-         return Ok(Some(asset));
-      },
-      "CRLMediaItem" | "CRLMovieItem" => {
-         let asset = assets::decode_asset(record);
-         item.kind = match assets::decode_media(record) {
-            FreeformItemKind::Media { asset_id, media_type } => {
-               FreeformItemKind::Media { asset_id, media_type }
-            },
-            _ => FreeformItemKind::Media { asset_id: None, media_type: None },
-         };
-         return Ok(Some(asset));
-      },
-      "CRLFileItem" => {
-         let asset = assets::decode_asset(record);
-         item.kind = match assets::decode_media(record) {
-            FreeformItemKind::File { asset_id, filename } => {
-               FreeformItemKind::File { asset_id, filename }
-            },
-            _ => FreeformItemKind::File { asset_id: None, filename: None },
-         };
-         return Ok(Some(asset));
-      },
-      "CRLURLItem" | "CRLUrlItem" => {
-         item.kind = match assets::decode_media(record) {
-            FreeformItemKind::Url { url, title } => FreeformItemKind::Url { url, title },
-            _ => FreeformItemKind::Url { url: None, title: None },
-         };
-      },
-      "CRLUsdzItem" | "CRLUSDZItem" => {
-         let asset = assets::decode_asset(record);
-         item.kind = match assets::decode_media(record) {
-            FreeformItemKind::Usdz { asset_id, spatial_transform } => {
-               FreeformItemKind::Usdz { asset_id, spatial_transform }
-            },
-            _ => FreeformItemKind::Usdz { asset_id: None, spatial_transform: None },
-         };
-         return Ok(Some(asset));
-      },
-      _ => {},
-   }
-   Ok(None)
-}
-
-fn validate_connector_references(
-   tail: &FreeformConnectorEndpoint,
-   head: &FreeformConnectorEndpoint,
-   item_ids: &[String],
-) -> Result<(), FreeformDecodeError> {
-   for endpoint in [tail, head] {
-      if let Some(item_id) = &endpoint.item_id {
-         if !item_ids.iter().any(|candidate| candidate == item_id) {
-            return Err(FreeformDecodeError::correlation(format!(
-               "connector references missing board item {item_id}"
-            )));
-         }
+fn validate_references(items: &[FreeformBoardItem]) -> Result<(), FreeformDecodeError> {
+   fn collect<'a>(items: &'a [FreeformBoardItem], ids: &mut BTreeSet<&'a str>) {
+      for item in items {
+         ids.insert(&item.uuid);
+         collect(&item.children, ids);
       }
    }
-   Ok(())
-}
-
-fn validate_group_references(
-   child_ids: &[String],
-   item_ids: &[String],
-) -> Result<(), FreeformDecodeError> {
-   for child_id in child_ids {
-      if !item_ids.iter().any(|candidate| candidate == child_id) {
-         return Err(FreeformDecodeError::correlation(format!(
-            "group references missing board item {child_id}"
-         )));
-      }
-   }
-   Ok(())
-}
-
-fn apply_parent_ids(items: &mut [FreeformBoardItem]) -> Result<(), FreeformDecodeError> {
-   let mut parents = BTreeMap::new();
-   for item in items.iter() {
-      if let FreeformItemKind::Group { child_ids, .. } = &item.kind {
-         for child_id in child_ids {
-            if child_id == &item.uuid {
-               return Err(FreeformDecodeError::correlation(format!(
-                  "group {} contains itself",
-                  item.uuid
-               )));
-            }
-            if let Some(previous) = parents.insert(child_id.clone(), item.uuid.clone()) {
-               return Err(FreeformDecodeError::correlation(format!(
-                  "board item {child_id} belongs to both {previous} and {}",
-                  item.uuid
-               )));
+   fn validate(
+      items: &[FreeformBoardItem],
+      ids: &BTreeSet<&str>,
+   ) -> Result<(), FreeformDecodeError> {
+      for item in items {
+         if let FreeformItemKind::Group { child_ids, .. } = &item.kind {
+            for id in child_ids {
+               if !item.children.iter().any(|child| &child.uuid == id) {
+                  return Err(FreeformDecodeError::correlation(format!(
+                     "group {} has no serialized child {id}",
+                     item.uuid
+                  )));
+               }
             }
          }
-      }
-   }
-   for child_id in parents.keys() {
-      let mut visited = BTreeSet::new();
-      let mut current = child_id.as_str();
-      while let Some(parent_id) = parents.get(current) {
-         if !visited.insert(current) {
-            return Err(FreeformDecodeError::correlation(format!(
-               "groups contain a parent cycle through {current}"
-            )));
+         if let FreeformItemKind::Table { cells, .. } = &item.kind {
+            for id in cells.iter().flat_map(|cell| &cell.anchored_item_ids) {
+               if !ids.contains(id.as_str()) {
+                  return Err(FreeformDecodeError::correlation(format!(
+                     "table {} references missing item {id}",
+                     item.uuid
+                  )));
+               }
+            }
          }
-         current = parent_id;
+         validate(&item.children, ids)?;
       }
+      Ok(())
    }
-   for item in items {
-      item.parent_id = parents.remove(&item.uuid);
-   }
-   if let Some((child_id, parent_id)) = parents.into_iter().next() {
-      return Err(FreeformDecodeError::correlation(format!(
-         "group {parent_id} references missing board item {child_id}"
-      )));
-   }
-   Ok(())
+   let mut ids = BTreeSet::new();
+   collect(items, &mut ids);
+   validate(items, &ids)
+}
+
+/// Labels malformed native data found by the CRL submodules.
+fn invalid(message: &str) -> FreeformDecodeError {
+   FreeformDecodeError::invalid(format!("native protobuf: {message}"))
+}
+
+/// Rejects non-finite numeric values before they reach the public model.
+fn finite(value: f64) -> Result<f64, FreeformDecodeError> {
+   value
+      .is_finite()
+      .then_some(value)
+      .ok_or_else(|| invalid("non-finite numeric value"))
+}
+
+/// Widens an optional native float32, rejecting non-finite values.
+fn float32(value: Option<f32>) -> Result<Option<f64>, FreeformDecodeError> {
+   value.map(|value| finite(f64::from(value))).transpose()
 }
 
 #[cfg(test)]
 mod tests {
-   use std::collections::HashMap;
-
    use super::*;
-
    const NATIVE: &[u8] = include_bytes!("../fixtures/real-board.crlnative");
    const TSU: &[u8] = include_bytes!("../fixtures/real-board.tsudescription");
+
    #[test]
-   fn native_records_remain_unknown_and_lossless_without_tsu() {
-      let native = decode_crl_native(NATIVE).expect("native fixture parses");
-      assert_eq!(native.items.len(), 10);
-      assert!(native.items.iter().any(|item| !item.raw_data.is_empty()));
-      assert_eq!(native.paste_id, "42753C09-5C97-4F7E-A652-F842FEFFCEAD");
-      assert!(native.items.iter().all(|item| item.class_name.is_none()));
+   fn real_native_payloads_decode_without_tsu() {
+      let native = decode_crl_native(NATIVE).unwrap();
+      assert!(
+         matches!(&native.items[7].kind, FreeformItemKind::StickyNote { text: Some(text) } if text.plain == "hi")
+      );
+      let table = &native.items[8];
+      assert!(
+         matches!(&table.kind, FreeformItemKind::Table { column_widths, cells, .. } if column_widths == &[344.0,344.0] && cells.len() == 4)
+      );
+      assert_eq!(table.children[0].uuid, "5AAC3C24-07E5-4429-8B8C-D0FF59B8961D");
+      assert_eq!(table.children[0].parent_id.as_deref(), Some(table.uuid.as_str()));
       assert_eq!(native.raw_archive, parse_native_archive(NATIVE).unwrap().archive);
    }
 
    #[test]
-   fn parsed_tsu_joins_by_equal_ordered_cardinality() {
-      let entries = parse_tsu_description(TSU).expect("TSU fixture parses");
-      let native = join_crl_tsu(decode_crl_native(NATIVE).unwrap(), &entries).expect("tiers join");
-      for (item, entry) in native.items.iter().zip(entries.iter()) {
-         assert_eq!(item.class_name.as_deref(), Some(entry.class_name.as_str()));
-      }
+   fn tsu_refines_textboxes_without_discarding_native_labels() {
+      let native =
+         join_crl_tsu(decode_crl_native(NATIVE).unwrap(), &parse_tsu_description(TSU).unwrap())
+            .unwrap();
+      assert!(matches!(native.items[0].kind, FreeformItemKind::TextBox { .. }));
+      assert!(matches!(native.items[2].kind, FreeformItemKind::TextBox { .. }));
+      assert!(matches!(native.items[5].kind, FreeformItemKind::Shape { .. }));
    }
 
    #[test]
-   fn malformed_tsu_is_an_independent_invalid_tier() {
-      assert_eq!(
-         parse_tsu_description(b"not a plist").unwrap_err().kind,
-         super::super::types::FreeformDecodeErrorKind::Invalid
-      );
-      assert_eq!(decode_crl_native(NATIVE).unwrap().items.len(), 10);
-   }
-
-   #[test]
-   fn tsu_values_remain_recursive_and_reject_unrepresentable_plist_types() {
-      let value = Plist::Dict(HashMap::from([(
-         "nested".into(),
-         Plist::Array(vec![Plist::Bool(true), Plist::Data(vec![7, 8])]),
-      )]));
-      assert_eq!(
-         tsu_value(&value).unwrap(),
-         TsuValue::Dictionary(BTreeMap::from([(
-            "nested".into(),
-            TsuValue::Array(vec![TsuValue::Bool(true), TsuValue::Data(vec![7, 8])]),
-         )]))
-      );
-      assert_eq!(
-         tsu_value(&Plist::Uid(1)).unwrap_err().kind,
-         super::super::types::FreeformDecodeErrorKind::Invalid
-      );
-   }
-   #[test]
-   fn mismatch_is_a_correlation_error_without_partial_join() {
+   fn incorrect_tsu_count_or_class_cannot_relabel_native_objects() {
       let native = decode_crl_native(NATIVE).unwrap();
-      let entries = parse_tsu_description(TSU).unwrap();
-      let error = join_crl_tsu(native, &entries[..entries.len() - 1]).unwrap_err();
-      assert_eq!(error.kind, super::super::types::FreeformDecodeErrorKind::CorrelationMismatch);
+      let mut entries = parse_tsu_description(TSU).unwrap();
+      assert!(join_crl_tsu(native.clone(), &entries[..entries.len() - 1]).is_err());
+      entries[0].class_name = "CRLImageItem".into();
+      assert!(join_crl_tsu(native, &entries).is_err());
    }
 
    #[test]
-   fn unknown_item_retains_its_bounded_raw_record() {
-      let bytes = [0xde, 0xad, 0xbe, 0xef];
-      let record = NativeRecord { owner_id: "item-id".into(), offset: 17, bytes: &bytes };
-      let item = board_item_from_records(0, "item-id", vec![&record]);
-      assert!(matches!(item.kind, FreeformItemKind::Unknown));
-      assert_eq!(item.raw_data, bytes);
+   fn malformed_tsu_does_not_prevent_native_decoding() {
+      assert!(parse_tsu_description(b"not a plist").is_err());
+      assert!(decode_crl_native(NATIVE).is_ok());
    }
 }

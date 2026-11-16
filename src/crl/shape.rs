@@ -1,896 +1,673 @@
-//! Record-bounded decoder for native geometric shapes.
+//! Native shape schemas, shared by shape, text, table, and media decoders.
 //!
-//! The CRL object graph contains many protobuf-like CRDT envelopes.  This
-//! module only assigns a semantic value when its complete enclosing message is
-//! present in the current [`NativeRecord`]; it deliberately does not scan
-//! neighbouring records or group floating-point values by byte distance.
+//! The field paths below are the installed application's Codable coding keys,
+//! not searches through arbitrary nested protobuf messages. `CRLFillData`
+//! currently has only the `color` alternative; gradients are not part of this
+//! schema.
 
-use super::envelope::NativeRecord;
+use super::{
+   coherence::{Node, Value},
+   finite, float32, invalid,
+};
 use crate::types::{
-   FreeformColor, FreeformDecodeError, FreeformFrame, FreeformGeometry, FreeformGradientStop,
-   FreeformPaint, FreeformPath, FreeformPathCommand, FreeformPoint, FreeformShadow, FreeformSize,
-   FreeformStrokeStyle, FreeformStyle, FreeformTransform,
+   FreeformColor, FreeformColorComponents, FreeformDecodeError, FreeformFrame, FreeformGeometry,
+   FreeformPaint, FreeformPath, FreeformPathCommand, FreeformPathSource,
+   FreeformPencilKitStrokeStyle, FreeformPoint, FreeformShadow, FreeformSize, FreeformStrokeStyle,
+   FreeformStyle,
 };
 
-#[derive(Clone, Copy)]
-enum Wire<'a> {
-   Varint(u64),
-   Fixed32(f32),
-   Fixed64(f64),
-   Bytes(&'a [u8]),
+type Result<T, E = FreeformDecodeError> = std::result::Result<T, E>;
+
+/// `CRLProto` geometry schemas.
+mod proto {
+   use crate::wire::{self, Repeated};
+
+   wire::message! {
+      /// `CRLProto_Point`; protobuf scalar defaults are significant, so an
+      /// empty message is (0, 0).
+      pub struct Point {
+         x: Option<f32> = 1,
+         y: Option<f32> = 2,
+      }
+   }
+
+   wire::message! {
+      /// `CRLProto_Path`.
+      pub struct Path<'a> {
+         elements: Repeated<'a, PathElement<'a>> = 1,
+      }
+   }
+
+   wire::message! {
+      /// One path command; points are packed float pairs.
+      pub struct PathElement<'a> {
+         /// 0 move, 1 line, 2 cubic, 3 close.
+         kind: Option<u64> = 1,
+         end_point: Option<&'a [u8]> = 2,
+         /// Offset from the end point.
+         control_point_1: Option<&'a [u8]> = 3,
+         /// Offset from the end point.
+         control_point_2: Option<&'a [u8]> = 4,
+      }
+   }
 }
 
-#[derive(Clone, Copy)]
-struct Field<'a> {
-   number: u32,
-   value:  Wire<'a>,
+pub(super) struct DecodedShape {
+   pub preset:   Option<String>,
+   pub path:     Option<FreeformPath>,
+   pub geometry: FreeformGeometry,
+   pub style:    FreeformStyle,
 }
 
-/// Decodes a single archive-bounded native shape record.
-///
-/// A record that has no currently-proven shape fields is still successful: the
-/// caller retains `record.bytes` as the board item's raw data.  Truncated wire
-/// values are reported rather than being padded with zeroes.
-pub fn decode_shape(
-   record: &NativeRecord<'_>,
-) -> Result<
-   (Option<String>, Option<FreeformPath>, FreeformGeometry, FreeformStyle),
-   FreeformDecodeError,
-> {
-   let fields = fields(record.bytes)?;
-   let preset = find_preset(&fields);
-   let geometry = find_geometry(record.bytes, &fields);
-   let path = if is_ink_record(record.bytes) {
-      None
+/// Common.b is `CRLShapeItemParentAffinity` for shape-derived persistence
+/// types, and `CRLBoardItemParentAffinity` for other board items.
+/// `ShapeStyleData` is the shape superclass's `a` composite, underneath each
+/// subclass's `a` superData.
+pub(super) fn decode_shape(
+   common: Node<'_>,
+   specific: Option<Node<'_>>,
+   persistence_type: u32,
+) -> Result<DecodedShape> {
+   let shape_item = matches!(persistence_type, 3 | 4 | 11 | 12);
+   let affinity = common.property("b")?;
+   let general = if shape_item {
+      affinity.map(|value| value.field(0)).transpose()?.flatten()
    } else {
-      find_path(&fields)
+      affinity
    };
-   let style = find_style(&fields);
-   Ok((preset, path, geometry, style))
+   let geometry = match general.map(|value| value.field(1)).transpose()?.flatten() {
+      Some(value) => geometry(value)?,
+      None => FreeformGeometry::default(),
+   };
+   let source = if shape_item {
+      affinity.map(|value| value.field(1)).transpose()?.flatten()
+   } else {
+      None
+   };
+   let preset = source.map(|value| string(value, 2)).transpose()?.flatten();
+   let path = source.map(path).transpose()?.flatten();
+   let mut style = FreeformStyle::default();
+   if let Some(value) = common.property("f")? {
+      style.shadows.push(shadow(value)?);
+   }
+   let style_node = match (specific, persistence_type) {
+      (Some(node), 12) => node.at(&["a", "a", "a"])?,
+      (Some(node), 3 | 4 | 11) => node.at(&["a", "a"])?,
+      _ => None,
+   };
+   if let Some(node) = style_node {
+      style.fill = node.property("a")?.map(paint).transpose()?.flatten();
+      style.stroke = node.property("b")?.map(stroke).transpose()?.flatten();
+      if let Some(stroke) = &mut style.stroke {
+         stroke.head_end = node
+            .property("c")?
+            .map(|value| string(value, 4))
+            .transpose()?
+            .flatten();
+         stroke.tail_end = node
+            .property("d")?
+            .map(|value| string(value, 4))
+            .transpose()?
+            .flatten();
+         if let Some(offset) = node.property("e")? {
+            stroke.pattern_offset_distance = offset.number()?;
+         }
+      }
+   }
+   Ok(DecodedShape { preset, path, geometry, style })
 }
 
-fn fields(data: &[u8]) -> Result<Vec<Field<'_>>, FreeformDecodeError> {
-   let mut offset = 0;
-   let mut result = Vec::new();
-   while offset < data.len() {
-      let (key, next) = varint(data, offset)?;
-      offset = next;
-      let number = u32::try_from(key >> 3)
-         .ok()
-         .filter(|number| *number != 0)
-         .ok_or_else(|| FreeformDecodeError::invalid("shape record: invalid protobuf field"))?;
-      let value = match key & 7 {
-         0 => {
-            let (value, next) = varint(data, offset)?;
-            offset = next;
-            Wire::Varint(value)
-         },
-         1 => {
-            let bytes: [u8; 8] = data
-               .get(offset..offset + 8)
-               .ok_or_else(|| FreeformDecodeError::incomplete("shape record: truncated fixed64"))?
-               .try_into()
-               .map_err(|_| FreeformDecodeError::incomplete("shape record: truncated fixed64"))?;
-            offset += 8;
-            Wire::Fixed64(f64::from_le_bytes(bytes))
-         },
-         2 => {
-            let (length, next) = varint(data, offset)?;
-            offset = next;
-            let length = usize::try_from(length)
-               .map_err(|_| FreeformDecodeError::invalid("shape record: oversized message"))?;
-            let end = offset
-               .checked_add(length)
-               .filter(|end| *end <= data.len())
-               .ok_or_else(|| FreeformDecodeError::incomplete("shape record: truncated message"))?;
-            let bytes = &data[offset..end];
-            offset = end;
-            Wire::Bytes(bytes)
-         },
-         5 => {
-            let bytes: [u8; 4] = data
-               .get(offset..offset + 4)
-               .ok_or_else(|| FreeformDecodeError::incomplete("shape record: truncated fixed32"))?
-               .try_into()
-               .map_err(|_| FreeformDecodeError::incomplete("shape record: truncated fixed32"))?;
-            offset += 4;
-            Wire::Fixed32(f32::from_le_bytes(bytes))
-         },
+fn field(value: Value<'_>, key: u64) -> Result<Option<Value<'_>>> {
+   value
+      .field(key)?
+      .map(Value::optional)
+      .transpose()
+      .map(Option::flatten)
+}
+
+fn required(value: Value<'_>, key: u64) -> Result<Value<'_>> {
+   field(value, key)?.ok_or_else(|| invalid("missing native shape coding key"))
+}
+
+fn number(value: Value<'_>, key: u64) -> Result<Option<f64>> {
+   field(value, key)?
+      .map(Value::number)
+      .transpose()
+      .map(Option::flatten)
+}
+
+fn scalar(value: Value<'_>, key: u64) -> Result<f64> {
+   number(value, key)?.ok_or_else(|| invalid("missing native shape number"))
+}
+
+fn integer(value: Value<'_>, key: u64) -> Result<i64> {
+   required(value, key)?
+      .integer()?
+      .ok_or_else(|| invalid("missing native shape enum"))
+}
+
+fn boolean(value: Value<'_>, key: u64) -> Result<Option<bool>> {
+   field(value, key)?
+      .map(Value::boolean)
+      .transpose()
+      .map(Option::flatten)
+}
+
+fn string(value: Value<'_>, key: u64) -> Result<Option<String>> {
+   Ok(field(value, key)?
+      .map(Value::string)
+      .transpose()?
+      .flatten()
+      .map(str::to_owned))
+}
+
+/// `CRLPointData` and `CRLSizeData` encode as opaque `CRLProto_Point` data.
+/// Protobuf scalar defaults are significant: an empty data value is the point
+/// (0, 0).
+pub(super) fn point(value: Value<'_>) -> Result<Option<FreeformPoint>> {
+   let Some(bytes) = value.data()? else {
+      return Ok(None);
+   };
+   let point = proto::Point::parse(bytes)?;
+   Ok(Some(FreeformPoint {
+      x: float32(point.x)?.unwrap_or(0.0),
+      y: float32(point.y)?.unwrap_or(0.0),
+   }))
+}
+
+fn required_point(value: Value<'_>, key: u64) -> Result<FreeformPoint> {
+   point(required(value, key)?)?.ok_or_else(|| invalid("missing native shape point data"))
+}
+
+fn size(value: Value<'_>, key: u64) -> Result<FreeformSize> {
+   let point = required_point(value, key)?;
+   Ok(FreeformSize { width: point.x, height: point.y })
+}
+
+/// `CRLCanvasInfoGeometryData` encoder 0x101259338; the canvas consumer
+/// 0x1000397c0 changes clockwise archived degrees to counterclockwise radians.
+pub(super) fn geometry(value: Value<'_>) -> Result<FreeformGeometry> {
+   let position = required_point(value, 0)?;
+   let size = required_point(value, 1)?;
+   Ok(FreeformGeometry {
+      frame: Some(FreeformFrame {
+         x:        position.x,
+         y:        position.y,
+         w:        size.x,
+         h:        size.y,
+         rotation: -scalar(value, 2)?.to_radians(),
+      }),
+      width_valid: boolean(value, 3)?,
+      height_valid: boolean(value, 4)?,
+      horizontal_flip: boolean(value, 5)?,
+      vertical_flip: boolean(value, 6)?,
+      ..FreeformGeometry::default()
+   })
+}
+
+/// `TSUColorData` encoder 0x100bdec44 and consumer 0x100bdcbb0. Alpha is
+/// optional key 0 (native default 1), not a fourth RGB component. Device CMYK
+/// and gray stay in their source model rather than pretending to be sRGB.
+pub(super) fn color(value: Value<'_>) -> Result<Option<FreeformColor>> {
+   let Some(value) = value.optional()? else {
+      return Ok(None);
+   };
+   let alpha = number(value, 0)?.unwrap_or(1.0);
+   let rgb = field(value, 1)?;
+   let cmyk = field(value, 2)?;
+   let monochrome = field(value, 3)?;
+   if usize::from(rgb.is_some()) + usize::from(cmyk.is_some()) + usize::from(monochrome.is_some())
+      != 1
+   {
+      return Err(invalid("color must contain exactly one color model"));
+   }
+   let (color_space, components, hex) = if let Some(rgb) = rgb {
+      let red = scalar(rgb, 1)?;
+      let green = scalar(rgb, 2)?;
+      let blue = scalar(rgb, 3)?;
+      let space = integer(rgb, 0)?;
+      let (name, hex) = match space {
+         0 => ("sRGB", Some(css_hex(red, green, blue, alpha))),
+         1 => ("Display P3", None),
          _ => {
-            return Err(FreeformDecodeError::invalid(
-               "shape record: unsupported protobuf wire type",
-            ));
+            return Err(FreeformDecodeError::unsupported(format!(
+               "native RGB color space {space}"
+            )));
          },
       };
-      result.push(Field { number, value });
+      (name, FreeformColorComponents::Rgb { red, green, blue }, hex)
+   } else if let Some(cmyk) = cmyk {
+      (
+         "Device CMYK",
+         FreeformColorComponents::Cmyk {
+            cyan:    scalar(cmyk, 0)?,
+            magenta: scalar(cmyk, 1)?,
+            yellow:  scalar(cmyk, 2)?,
+            black:   scalar(cmyk, 3)?,
+         },
+         None,
+      )
+   } else {
+      let monochrome = monochrome.expect("exactly one native color model");
+      ("Device Gray", FreeformColorComponents::Monochrome { white: scalar(monochrome, 0)? }, None)
+   };
+   Ok(Some(FreeformColor { color_space: color_space.into(), components, alpha, hex }))
+}
+
+fn css_hex(red: f64, green: f64, blue: f64, alpha: f64) -> String {
+   let channel = |value: f64| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+   if alpha == 1.0 {
+      format!("#{:02X}{:02X}{:02X}", channel(red), channel(green), channel(blue))
+   } else {
+      format!(
+         "#{:02X}{:02X}{:02X}{:02X}",
+         channel(red),
+         channel(green),
+         channel(blue),
+         channel(alpha)
+      )
    }
+}
+
+/// `CRLFillData` encoder 0x100ceb448: type 0 is color, key 1 is `TSUColorData`.
+/// Unknown extensible alternatives retain exactly their own `CRValue` bytes.
+pub(super) fn paint(value: Value<'_>) -> Result<Option<FreeformPaint>> {
+   let Some(value) = value.optional()? else {
+      return Ok(None);
+   };
+   if integer(value, 0)? != 0 {
+      return Ok(Some(FreeformPaint::Unknown { raw_data: value.bytes.to_vec() }));
+   }
+   Ok(color(required(value, 1)?)?.map(|color| FreeformPaint::Solid { color }))
+}
+
+/// `CRLStrokeData` encoder 0x1012f0c5c. Pattern is an optional custom value,
+/// not a scan for adjacent floats. Empty is a real enum case, not width zero.
+pub(super) fn stroke(value: Value<'_>) -> Result<Option<FreeformStrokeStyle>> {
+   let Some(value) = value.optional()? else {
+      return Ok(None);
+   };
+   match integer(value, 0)? {
+      0 | 1 => {},
+      2 => return Ok(None),
+      kind => return Err(FreeformDecodeError::unsupported(format!("native stroke type {kind}"))),
+   }
+   let color = color(required(value, 1)?)?.ok_or_else(|| invalid("stroke has no color"))?;
+   let mut dash = Vec::new();
+   let dash_offset = if let Some(pattern) = field(value, 6)? {
+      for value in required(pattern, 0)?.elements()? {
+         dash.push(
+            value?
+               .number()?
+               .ok_or_else(|| invalid("stroke dash is not numeric"))?,
+         );
+      }
+      number(pattern, 1)?
+   } else {
+      None
+   };
+   let smart_stroke = field(value, 7)?
+      .map(|source| {
+         enum_name(
+            integer(source, 0)?,
+            &["chalk", "dryBrush", "featheredBrush", "pen", "pencil", "crayon", "calligraphy"],
+            "smart stroke",
+         )
+      })
+      .transpose()?;
+   let pencil_kit = field(value, 8)?
+      .map(|source| -> Result<_> {
+         Ok(FreeformPencilKitStrokeStyle {
+            ink_type:        string(source, 0)?
+               .ok_or_else(|| invalid("missing PencilKit ink identifier"))?,
+            width:           scalar(source, 1)?,
+            fountain_pen_v2: boolean(source, 2)?,
+         })
+      })
+      .transpose()?;
+   Ok(Some(FreeformStrokeStyle {
+      paint: FreeformPaint::Solid { color },
+      width: scalar(value, 2)?,
+      dash,
+      dash_offset,
+      cap: Some(enum_name(integer(value, 3)?, &["butt", "round", "square"], "stroke cap")?),
+      join: Some(enum_name(integer(value, 4)?, &["miter", "round", "bevel"], "stroke join")?),
+      miter_limit: number(value, 5)?,
+      head_end: None,
+      tail_end: None,
+      pattern_offset_distance: None,
+      smart_stroke,
+      pencil_kit,
+   }))
+}
+
+fn enum_name(value: i64, names: &[&str], kind: &str) -> Result<String> {
+   usize::try_from(value)
+      .ok()
+      .and_then(|index| names.get(index))
+      .map(|name| (*name).to_owned())
+      .ok_or_else(|| FreeformDecodeError::unsupported(format!("native {kind} {value}")))
+}
+
+/// Shadow offsetDelta (0x100410fec) rotates (offset,0) by positive degrees.
+fn shadow(value: Value<'_>) -> Result<FreeformShadow> {
+   let angle = scalar(value, 1)?;
+   let distance = scalar(value, 2)?;
+   let (sin, cos) = angle.to_radians().sin_cos();
+   let curve = field(value, 5)?.map(|value| scalar(value, 0)).transpose()?;
+   Ok(FreeformShadow {
+      kind: if curve.is_some() { "curved" } else { "drop" }.into(),
+      color: color(required(value, 0)?)?.ok_or_else(|| invalid("shadow has no color"))?,
+      offset_x: distance * cos,
+      offset_y: distance * sin,
+      radius: scalar(value, 3)?,
+      opacity: number(value, 4)?,
+      angle: Some(angle),
+      curve,
+   })
+}
+
+/// `CRLPathSourceData` coding keys (descriptor 0x10179f34c). Parametric sources
+/// remain parameters; we never substitute approximate polygons or Bézier arcs.
+pub(super) fn path(value: Value<'_>) -> Result<Option<FreeformPath>> {
+   let Some(value) = value.optional()? else {
+      return Ok(None);
+   };
+   let mut result = FreeformPath::default();
+   let mut alternatives = 0;
+   for key in 4..=9 {
+      let Some(source) = field(value, key)? else {
+         continue;
+      };
+      alternatives += 1;
+      match key {
+         4 => {
+            result.natural_size = Some(size(source, 2)?);
+            result.source = Some(FreeformPathSource::Point {
+               name:  enum_name(
+                  integer(source, 0)?,
+                  &["leftSingleArrow", "rightSingleArrow", "doubleArrow", "star", "plus"],
+                  "point path",
+               )?,
+               point: required_point(source, 1)?,
+            });
+         },
+         5 => {
+            result.natural_size = Some(size(source, 2)?);
+            result.source = Some(FreeformPathSource::Scalar {
+               name:             enum_name(
+                  integer(source, 0)?,
+                  &["roundedRectangle", "regularPolygon", "chevron"],
+                  "scalar path",
+               )?,
+               scalar:           scalar(source, 1)?,
+               curve_continuous: boolean(source, 3)?
+                  .ok_or_else(|| invalid("missing path curve continuity"))?,
+               show_knob:        boolean(source, 4)?
+                  .ok_or_else(|| invalid("missing path knob state"))?,
+            });
+         },
+         6 => decode_bezier_source(source, &mut result)?,
+         7 => {
+            result.natural_size = Some(size(source, 4)?);
+            result.source = Some(FreeformPathSource::Callout {
+               tail_position: required_point(source, 0)?,
+               tail_size:     scalar(source, 1)?,
+               corner_radius: scalar(source, 2)?,
+               center_tail:   boolean(source, 3)?
+                  .ok_or_else(|| invalid("missing callout center state"))?,
+            });
+         },
+         8 => decode_bezier_source(required(source, 1)?, &mut result)?,
+         9 => decode_editable(source, &mut result)?,
+         _ => unreachable!(),
+      }
+   }
+   if alternatives > 1 {
+      return Err(invalid("multiple native path source alternatives"));
+   }
+   if alternatives == 0 {
+      return Ok(None);
+   }
+   result.horizontal_flip = boolean(value, 0)?;
+   result.vertical_flip = boolean(value, 1)?;
+   result.raw_data = value.bytes.to_vec();
+   Ok(Some(result))
+}
+
+fn decode_bezier_source(value: Value<'_>, result: &mut FreeformPath) -> Result<()> {
+   let bytes = required(value, 0)?
+      .data()?
+      .ok_or_else(|| invalid("missing bezier path data"))?;
+   decode_bezier(bytes, &mut result.commands)?;
+   result.natural_size = Some(size(value, 1)?);
+   Ok(())
+}
+
+/// Decodes an inline `CRLProto_Path`, including `PencilKit` stroke mask paths.
+pub(super) fn bezier_bytes(bytes: &[u8]) -> Result<FreeformPath> {
+   let mut result = FreeformPath::default();
+   decode_bezier(bytes, &mut result.commands)?;
+   result.raw_data = bytes.to_vec();
    Ok(result)
 }
 
-fn varint(data: &[u8], mut offset: usize) -> Result<(u64, usize), FreeformDecodeError> {
-   let mut value = 0u64;
-   for shift in (0..64).step_by(7) {
-      let byte = *data
-         .get(offset)
-         .ok_or_else(|| FreeformDecodeError::incomplete("shape record: truncated varint"))?;
-      offset += 1;
-      value |= u64::from(byte & 0x7f) << shift;
-      if byte & 0x80 == 0 {
-         return Ok((value, offset));
-      }
-   }
-   Err(FreeformDecodeError::invalid("shape record: overlong varint"))
-}
-
-fn nested(field: Field<'_>) -> Option<Vec<Field<'_>>> {
-   let Wire::Bytes(bytes) = field.value else {
-      return None;
-   };
-   fields(bytes).ok()
-}
-
-fn finite(value: f64) -> Option<f64> {
-   value.is_finite().then_some(value)
-}
-
-fn scalar(field: Field<'_>) -> Option<f64> {
-   match field.value {
-      Wire::Fixed32(value) => finite(f64::from(value)),
-      Wire::Fixed64(value) => finite(value),
-      Wire::Varint(value) => Some(value as f64),
-      Wire::Bytes(_) => None,
-   }
-}
-
-const fn bool_scalar(field: Field<'_>) -> Option<bool> {
-   match field.value {
-      Wire::Varint(0) => Some(false),
-      Wire::Varint(1) => Some(true),
-      _ => None,
-   }
-}
-
-fn point(fields: &[Field<'_>]) -> Option<FreeformPoint> {
-   let x = fields
-      .iter()
-      .find(|f| f.number == 1)
-      .copied()
-      .and_then(scalar)?;
-   let y = fields
-      .iter()
-      .find(|f| f.number == 2)
-      .copied()
-      .and_then(scalar)?;
-   Some(FreeformPoint { x, y })
-}
-
-fn point_field(field: Field<'_>) -> Option<FreeformPoint> {
-   nested(field).as_deref().and_then(point)
-}
-
-fn find_preset(record_fields: &[Field<'_>]) -> Option<String> {
-   for field in record_fields {
-      let Wire::Bytes(bytes) = field.value else {
-         continue;
-      };
-      if let Ok(value) = std::str::from_utf8(bytes) {
-         if preset_name(value) {
-            return Some(value.to_owned());
-         }
-      }
-      if let Ok(children) = fields(bytes) {
-         if let Some(value) = find_preset(&children) {
-            return Some(value);
-         }
-      }
-   }
-   None
-}
-
-fn preset_name(value: &str) -> bool {
-   let Some((name, revision)) = value.rsplit_once('_') else {
-      return false;
-   };
-   !name.is_empty()
-      && revision.as_bytes().iter().all(u8::is_ascii_digit)
-      && name
-         .bytes()
-         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-fn find_geometry(bytes: &[u8], fields: &[Field<'_>]) -> FreeformGeometry {
-   let mut result = geometry_from_fields(fields);
-   if result.frame.is_none() {
-      result.frame = legacy_frame(bytes);
-   }
-   result
-}
-
-fn geometry_from_fields(fields: &[Field<'_>]) -> FreeformGeometry {
-   let mut result = FreeformGeometry::default();
-   for field in fields {
-      let Some(children) = nested(*field) else {
-         continue;
-      };
-      let position = children
-         .iter()
-         .find(|f| f.number == 1)
-         .copied()
-         .and_then(point_field);
-      let size = children
-         .iter()
-         .find(|f| f.number == 2)
-         .copied()
-         .and_then(point_field);
-      // A pair of points alone is ambiguous: the same wire shape describes a
-      // linear-gradient vector.  A geometry archive carries at least one
-      // geometry-only companion (angle, flip/validity, anchor, or affine).
-      let geometry_trait = children.iter().any(|field| {
-         (field.number == 3 && scalar(*field).is_some()) || (4..=9).contains(&field.number)
-      });
-      if result.frame.is_none() && geometry_trait {
-         if let (Some(position), Some(size)) = (position, size) {
-            let rotation = children
-               .iter()
-               .find(|f| f.number == 3)
-               .copied()
-               .and_then(scalar)
-               .unwrap_or(0.0);
-            result.frame =
-               Some(FreeformFrame { x: position.x, y: position.y, w: size.x, h: size.y, rotation });
-            result.horizontal_flip = children
-               .iter()
-               .find(|f| f.number == 4)
-               .copied()
-               .and_then(bool_scalar);
-            result.vertical_flip = children
-               .iter()
-               .find(|f| f.number == 5)
-               .copied()
-               .and_then(bool_scalar);
-            result.width_valid = children
-               .iter()
-               .find(|f| f.number == 6)
-               .copied()
-               .and_then(bool_scalar);
-            result.height_valid = children
-               .iter()
-               .find(|f| f.number == 7)
-               .copied()
-               .and_then(bool_scalar);
-            result.anchor = children
-               .iter()
-               .find(|f| f.number == 8)
-               .copied()
-               .and_then(point_field);
-            result.transform = children
-               .iter()
-               .find(|f| f.number == 9)
-               .copied()
-               .and_then(transform_field);
-            return result;
-         }
-      }
-      let child = geometry_from_fields(&children);
-      merge_geometry(&mut result, child);
-   }
-   result
-}
-
-const fn merge_geometry(destination: &mut FreeformGeometry, source: FreeformGeometry) {
-   if destination.frame.is_none() {
-      destination.frame = source.frame;
-   }
-   if destination.transform.is_none() {
-      destination.transform = source.transform;
-   }
-   if destination.anchor.is_none() {
-      destination.anchor = source.anchor;
-   }
-   if destination.horizontal_flip.is_none() {
-      destination.horizontal_flip = source.horizontal_flip;
-   }
-   if destination.vertical_flip.is_none() {
-      destination.vertical_flip = source.vertical_flip;
-   }
-   if destination.width_valid.is_none() {
-      destination.width_valid = source.width_valid;
-   }
-   if destination.height_valid.is_none() {
-      destination.height_valid = source.height_valid;
-   }
-}
-
-fn transform_field(field: Field<'_>) -> Option<FreeformTransform> {
-   let children = nested(field)?;
-   let value = |number| {
-      children
-         .iter()
-         .find(|f| f.number == number)
-         .copied()
-         .and_then(scalar)
-   };
-   Some(FreeformTransform {
-      a:  value(1)?,
-      b:  value(2)?,
-      c:  value(3)?,
-      d:  value(4)?,
-      tx: value(5)?,
-      ty: value(6)?,
-   })
-}
-
-// Captured GeometryArchive positions use two adjacent point messages.  This
-// accepts the complete grammar, not merely nearby floats, and is intentionally
-// a frame-only fallback: the other geometry properties are not present there.
-fn legacy_frame(bytes: &[u8]) -> Option<FreeformFrame> {
-   let mut start = 0;
-   while start + 26 <= bytes.len() {
-      let Some(first) = geometry_point_at(bytes, start) else {
-         start += 1;
-         continue;
-      };
-      let second_at = start + 14;
-      let Some(second) = geometry_point_at(bytes, second_at) else {
-         start += 1;
-         continue;
-      };
-      let rotation = match bytes.get(second_at + 12..second_at + 19) {
-         Some([0x12, 0x05, 0x7d, a, b, c, d]) => {
-            finite(-f64::from(f32::from_le_bytes([*a, *b, *c, *d])) * std::f64::consts::PI / 180.0)
-               .unwrap_or(0.0)
+/// Native decoder 0x100c8e428 adds both control offsets to the END point, not
+/// to the preceding point.
+fn decode_bezier(bytes: &[u8], commands: &mut Vec<FreeformPathCommand>) -> Result<()> {
+   for element in proto::Path::parse(bytes)?.elements {
+      let element = element?;
+      let end_point = || packed_point(element.end_point.unwrap_or_default(), false);
+      let kind = element.kind.unwrap_or(0);
+      let command = match kind {
+         0 => FreeformPathCommand::Move { point: end_point()? },
+         1 => FreeformPathCommand::Line { point: end_point()? },
+         2 => {
+            let point = end_point()?;
+            let first = packed_point(element.control_point_1.unwrap_or_default(), true)?;
+            let second = packed_point(element.control_point_2.unwrap_or_default(), true)?;
+            FreeformPathCommand::Cubic {
+               point,
+               control_1: FreeformPoint {
+                  x: finite(point.x + first.x)?,
+                  y: finite(point.y + first.y)?,
+               },
+               control_2: FreeformPoint {
+                  x: finite(point.x + second.x)?,
+                  y: finite(point.y + second.y)?,
+               },
+            }
          },
-         _ => 0.0,
-      };
-      return Some(FreeformFrame { x: first.x, y: first.y, w: second.x, h: second.y, rotation });
-   }
-   None
-}
-
-fn geometry_point_at(bytes: &[u8], offset: usize) -> Option<FreeformPoint> {
-   let point = bytes.get(offset..offset + 12)?;
-   if point[0..3] != [0x22, 0x0a, 0x0d] || point[7] != 0x15 {
-      return None;
-   }
-   Some(FreeformPoint {
-      x: finite(f64::from(f32::from_le_bytes(point[3..7].try_into().ok()?)))?,
-      y: finite(f64::from(f32::from_le_bytes(point[8..12].try_into().ok()?)))?,
-   })
-}
-
-fn is_ink_record(bytes: &[u8]) -> bool {
-   bytes
-      .windows(b"com.apple.ink.".len())
-      .any(|part| part == b"com.apple.ink.")
-      || bytes
-         .windows(b"PKStroke".len())
-         .any(|part| part == b"PKStroke")
-}
-
-fn find_path(record_fields: &[Field<'_>]) -> Option<FreeformPath> {
-   for field in record_fields {
-      let Some(bytes) = (match field.value {
-         Wire::Bytes(bytes) => Some(bytes),
-         _ => None,
-      }) else {
-         continue;
-      };
-      if let Some(path) = path_message(bytes) {
-         return Some(FreeformPath {
-            commands:     path,
-            natural_size: natural_size(bytes),
-            raw_data:     bytes.to_vec(),
-         });
-      }
-      if let Ok(children) = fields(bytes) {
-         if let Some(path) = find_path(&children) {
-            return Some(path);
-         }
-      }
-   }
-   None
-}
-
-fn path_message(bytes: &[u8]) -> Option<Vec<FreeformPathCommand>> {
-   let nodes = fields(bytes).ok()?;
-   let mut commands = Vec::new();
-   for node in nodes {
-      let Some(node) = nested(node) else { continue };
-      let kind = node
-         .iter()
-         .find(|field| field.number == 1)
-         .and_then(|field| match field.value {
-            Wire::Varint(value) => Some(value),
-            _ => None,
-         });
-      let points: Vec<_> = node
-         .iter()
-         .filter(|field| field.number == 2)
-         .copied()
-         .filter_map(point_field)
-         .collect();
-      let command = match (kind, points.as_slice()) {
-         (Some(0), [point]) => FreeformPathCommand::Move { point: *point },
-         (Some(1), [point]) => FreeformPathCommand::Line { point: *point },
-         (Some(2), [control, point]) => {
-            FreeformPathCommand::Quadratic { control: *control, point: *point }
+         3 => FreeformPathCommand::Close,
+         _ => {
+            return Err(FreeformDecodeError::unsupported(format!("native bezier element {kind}")));
          },
-         (Some(3), [control_1, control_2, point]) => FreeformPathCommand::Cubic {
-            control_1: *control_1,
-            control_2: *control_2,
-            point:     *point,
-         },
-         (Some(4), []) => FreeformPathCommand::Close,
-         _ => continue,
       };
       commands.push(command);
    }
-   (!commands.is_empty()
-      && commands
-         .iter()
-         .any(|command| matches!(command, FreeformPathCommand::Move { .. })))
-   .then_some(commands)
+   Ok(())
 }
 
-fn natural_size(bytes: &[u8]) -> Option<FreeformSize> {
-   let fields = fields(bytes).ok()?;
-   for field in fields {
-      let Some(child) = nested(field) else { continue };
-      if let Some(point) = point(&child) {
-         return Some(FreeformSize { width: point.x, height: point.y });
+/// Empty points are native zero points. Endpoints require Float32 pairs;
+/// relative controls additionally accept Float16 pairs (decoder 0x100c8dd8c).
+fn packed_point(bytes: &[u8], control: bool) -> Result<FreeformPoint> {
+   let (x, y) = match bytes.len() {
+      0 => (0.0, 0.0),
+      8 => (
+         f64::from(f32::from_le_bytes(bytes[..4].try_into().expect("four bytes"))),
+         f64::from(f32::from_le_bytes(bytes[4..].try_into().expect("four bytes"))),
+      ),
+      4 if control => (
+         half(u16::from_le_bytes(bytes[..2].try_into().expect("two bytes"))),
+         half(u16::from_le_bytes(bytes[2..].try_into().expect("two bytes"))),
+      ),
+      _ => return Err(invalid("invalid native bezier point byte length")),
+   };
+   Ok(FreeformPoint { x: finite(x)?, y: finite(y)? })
+}
+
+fn half(bits: u16) -> f64 {
+   let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+   let fraction = f64::from(bits & 0x3ff);
+   let exponent = (bits >> 10) & 0x1f;
+   sign
+      * match exponent {
+         0 => fraction * 2.0_f64.powi(-24),
+         31 if fraction == 0.0 => f64::INFINITY,
+         31 => f64::NAN,
+         _ => (1024.0 + fraction) * 2.0_f64.powi(i32::from(exponent) - 25),
+      }
+}
+
+#[derive(Clone, Copy)]
+struct EditableNode {
+   point:    FreeformPoint,
+   incoming: FreeformPoint,
+   outgoing: FreeformPoint,
+}
+
+fn editable_node(value: Value<'_>) -> Result<EditableNode> {
+   Ok(EditableNode {
+      incoming: required_point(value, 0)?,
+      point:    required_point(value, 1)?,
+      outgoing: required_point(value, 2)?,
+   })
+}
+
+fn editable_edge(from: EditableNode, to: EditableNode) -> FreeformPathCommand {
+   // Exact equality preserves every archived control point. Near-equal native
+   // controls may draw as a line, but their actual cubic remains lossless here.
+   if from.point == from.outgoing && to.incoming == to.point {
+      FreeformPathCommand::Line { point: to.point }
+   } else {
+      FreeformPathCommand::Cubic {
+         control_1: from.outgoing,
+         control_2: to.incoming,
+         point:     to.point,
       }
    }
-   None
 }
 
-fn find_style(fields: &[Field<'_>]) -> FreeformStyle {
-   let mut style = FreeformStyle::default();
-   for field in fields {
-      let Some(child) = nested(*field) else {
+fn decode_editable(value: Value<'_>, result: &mut FreeformPath) -> Result<()> {
+   result.natural_size = Some(size(value, 2)?);
+   for subpath in required(value, 1)?.elements()? {
+      let subpath = subpath?;
+      let mut nodes = required(subpath, 0)?.elements()?;
+      let Some(first) = nodes.next() else {
          continue;
       };
-      // Only a complete visual-style envelope establishes that field 3 is
-      // opacity; a geometry record also has an unrelated scalar at field 3.
-      let fill = child
-         .iter()
-         .find(|f| f.number == 1)
-         .copied()
-         .and_then(paint_field);
-      let stroke = child
-         .iter()
-         .find(|f| f.number == 2)
-         .copied()
-         .and_then(stroke_field);
-      let shadows = child
-         .iter()
-         .filter(|f| f.number == 4)
-         .copied()
-         .filter_map(shadow_field)
-         .collect::<Vec<_>>();
-      if fill.is_some() || stroke.is_some() || !shadows.is_empty() {
-         if style.fill.is_none() {
-            style.fill = fill;
-         }
-         if style.stroke.is_none() {
-            style.stroke = stroke;
-         }
-         if style.opacity.is_none() {
-            style.opacity = child
-               .iter()
-               .find(|f| f.number == 3)
-               .copied()
-               .and_then(scalar)
-               .filter(|value| (0.0..=1.0).contains(value));
-         }
-         if style.shadows.is_empty() {
-            style.shadows = shadows;
-         }
+      let first = editable_node(first?)?;
+      result
+         .commands
+         .push(FreeformPathCommand::Move { point: first.point });
+      let mut previous = first;
+      for node in nodes {
+         let node = editable_node(node?)?;
+         result.commands.push(editable_edge(previous, node));
+         previous = node;
       }
-      let nested_style = find_style(&child);
-      if style.fill.is_none() {
-         style.fill = nested_style.fill;
-      }
-      if style.stroke.is_none() {
-         style.stroke = nested_style.stroke;
-      }
-      if style.opacity.is_none() {
-         style.opacity = nested_style.opacity;
-      }
-      if style.shadows.is_empty() {
-         style.shadows = nested_style.shadows;
+      if boolean(subpath, 1)?.ok_or_else(|| invalid("missing subpath closed state"))? {
+         result.commands.push(editable_edge(previous, first));
+         result.commands.push(FreeformPathCommand::Close);
       }
    }
-   style
-}
-
-fn paint_field(field: Field<'_>) -> Option<FreeformPaint> {
-   let Wire::Bytes(bytes) = field.value else {
-      return None;
-   };
-   let fields = fields(bytes).ok()?;
-   if let Some(color) = color(&fields) {
-      return Some(FreeformPaint::Solid { color });
-   }
-   if let Some(asset_id) = fields.iter().find(|f| f.number == 5).and_then(string_field) {
-      let technique = fields.iter().find(|f| f.number == 6).and_then(string_field);
-      return Some(FreeformPaint::Image { asset_id, technique });
-   }
-   let stops = fields
-      .iter()
-      .filter(|f| f.number == 3)
-      .copied()
-      .filter_map(stop_field)
-      .collect::<Vec<_>>();
-   if !stops.is_empty() {
-      if let Some(center) = fields
-         .iter()
-         .find(|f| f.number == 4)
-         .copied()
-         .and_then(point_field)
-      {
-         let radius = fields
-            .iter()
-            .find(|f| f.number == 5)
-            .copied()
-            .and_then(scalar)?;
-         return Some(FreeformPaint::RadialGradient { center, radius, stops });
-      }
-      let start = fields
-         .iter()
-         .find(|f| f.number == 1)
-         .copied()
-         .and_then(point_field)?;
-      let end = fields
-         .iter()
-         .find(|f| f.number == 2)
-         .copied()
-         .and_then(point_field)?;
-      return Some(FreeformPaint::LinearGradient { start, end, stops });
-   }
-   None
-}
-
-fn color(fields: &[Field<'_>]) -> Option<FreeformColor> {
-   let value = |number| {
-      fields
-         .iter()
-         .find(|field| field.number == number)
-         .copied()
-         .and_then(scalar)
-         .filter(|value| (0.0..=1.0).contains(value))
-   };
-   let red = value(1)?;
-   let green = value(2)?;
-   let blue = value(3)?;
-   let alpha = value(4).unwrap_or(1.0);
-   let color_space = fields
-      .iter()
-      .find(|field| field.number == 5)
-      .and_then(string_field)
-      .unwrap_or_else(|| "sRGB".into());
-   Some(FreeformColor { color_space, red, green, blue, alpha, hex: hex(red, green, blue) })
-}
-
-fn hex(red: f64, green: f64, blue: f64) -> String {
-   format!(
-      "#{:02x}{:02x}{:02x}",
-      (red * 255.0).round() as u8,
-      (green * 255.0).round() as u8,
-      (blue * 255.0).round() as u8
-   )
-}
-
-fn stop_field(field: Field<'_>) -> Option<FreeformGradientStop> {
-   let fields = nested(field)?;
-   Some(FreeformGradientStop {
-      fraction:   fields
-         .iter()
-         .find(|f| f.number == 1)
-         .copied()
-         .and_then(scalar)
-         .filter(|value| (0.0..=1.0).contains(value))?,
-      inflection: fields
-         .iter()
-         .find(|f| f.number == 2)
-         .copied()
-         .and_then(scalar),
-      color:      fields
-         .iter()
-         .find(|f| f.number == 3)
-         .copied()
-         .and_then(paint_field)
-         .and_then(|paint| match paint {
-            FreeformPaint::Solid { color } => Some(color),
-            _ => None,
-         })?,
-   })
-}
-
-fn stroke_field(field: Field<'_>) -> Option<FreeformStrokeStyle> {
-   let fields = nested(field)?;
-   Some(FreeformStrokeStyle {
-      paint:       fields
-         .iter()
-         .find(|f| f.number == 1)
-         .copied()
-         .and_then(paint_field)?,
-      width:       fields
-         .iter()
-         .find(|f| f.number == 2)
-         .copied()
-         .and_then(scalar)?,
-      dash:        fields
-         .iter()
-         .filter(|f| f.number == 3)
-         .copied()
-         .filter_map(scalar)
-         .collect(),
-      dash_offset: fields
-         .iter()
-         .find(|f| f.number == 4)
-         .copied()
-         .and_then(scalar),
-      cap:         fields.iter().find(|f| f.number == 5).and_then(string_field),
-      join:        fields.iter().find(|f| f.number == 6).and_then(string_field),
-      miter_limit: fields
-         .iter()
-         .find(|f| f.number == 7)
-         .copied()
-         .and_then(scalar),
-      tail_end:    fields.iter().find(|f| f.number == 8).and_then(string_field),
-      head_end:    fields.iter().find(|f| f.number == 9).and_then(string_field),
-   })
-}
-
-fn shadow_field(field: Field<'_>) -> Option<FreeformShadow> {
-   let fields = nested(field)?;
-   Some(FreeformShadow {
-      kind:     fields
-         .iter()
-         .find(|f| f.number == 1)
-         .and_then(string_field)?,
-      color:    fields
-         .iter()
-         .find(|f| f.number == 2)
-         .copied()
-         .and_then(paint_field)
-         .and_then(|paint| match paint {
-            FreeformPaint::Solid { color } => Some(color),
-            _ => None,
-         })?,
-      offset_x: fields
-         .iter()
-         .find(|f| f.number == 3)
-         .copied()
-         .and_then(scalar)?,
-      offset_y: fields
-         .iter()
-         .find(|f| f.number == 4)
-         .copied()
-         .and_then(scalar)?,
-      radius:   fields
-         .iter()
-         .find(|f| f.number == 5)
-         .copied()
-         .and_then(scalar)?,
-      opacity:  fields
-         .iter()
-         .find(|f| f.number == 6)
-         .copied()
-         .and_then(scalar)
-         .filter(|value| (0.0..=1.0).contains(value)),
-      angle:    fields
-         .iter()
-         .find(|f| f.number == 7)
-         .copied()
-         .and_then(scalar),
-   })
-}
-
-fn string_field(field: &Field<'_>) -> Option<String> {
-   let Wire::Bytes(bytes) = field.value else {
-      return None;
-   };
-   std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+   Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-   use super::*;
+   use super::{
+      super::{coherence::Document, envelope::parse_native_archive},
+      *,
+   };
 
-   fn varint(mut value: u64) -> Vec<u8> {
-      let mut bytes = Vec::new();
-      loop {
-         let mut byte = (value & 0x7f) as u8;
-         value >>= 7;
-         if value != 0 {
-            byte |= 0x80;
-         }
-         bytes.push(byte);
-         if value == 0 {
-            return bytes;
-         }
-      }
-   }
-
-   fn field(number: u32, wire: u8, value: &[u8]) -> Vec<u8> {
-      let mut bytes = varint(u64::from(number << 3 | u32::from(wire)));
-      if wire == 2 {
-         bytes.extend(varint(value.len() as u64));
-      }
-      bytes.extend(value);
-      bytes
-   }
-
-   fn message(number: u32, value: Vec<u8>) -> Vec<u8> {
-      field(number, 2, &value)
-   }
-
-   fn float(number: u32, value: f32) -> Vec<u8> {
-      field(number, 5, &value.to_le_bytes())
-   }
-
-   fn point(x: f32, y: f32) -> Vec<u8> {
-      let mut bytes = float(1, x);
-      bytes.extend(float(2, y));
-      bytes
-   }
-
-   fn color(red: f32, green: f32, blue: f32, alpha: f32) -> Vec<u8> {
-      let mut bytes = float(1, red);
-      bytes.extend(float(2, green));
-      bytes.extend(float(3, blue));
-      bytes.extend(float(4, alpha));
-      bytes
-   }
-
-   fn record(bytes: &[u8]) -> NativeRecord<'_> {
-      NativeRecord { owner_id: "00000000-0000-0000-0000-000000000000".into(), offset: 0, bytes }
-   }
+   const REAL: &[u8] = include_bytes!("../../fixtures/real-board.crlnative");
 
    #[test]
-   fn retains_preset_identifiers() {
-      for preset in ["Circle_950", "Triangle_950", "Parallelogram_950"] {
-         let bytes = message(15, preset.as_bytes().to_vec());
-         let (found, ..) = decode_shape(&record(&bytes)).unwrap();
-         assert_eq!(found.as_deref(), Some(preset));
-      }
-   }
-
-   #[test]
-   fn preserves_cubic_commands_and_subpaths() {
-      let mut path = Vec::new();
-      for (kind, points) in [
-         (0, vec![point(1.0, 2.0)]),
-         (3, vec![point(3.0, 4.0), point(5.0, 6.0), point(7.0, 8.0)]),
-         (4, vec![]),
-         (0, vec![point(9.0, 10.0)]),
-         (1, vec![point(11.0, 12.0)]),
-      ] {
-         let mut node = field(1, 0, &varint(kind));
-         for control in points {
-            node.extend(message(2, control));
-         }
-         path.extend(message(1, node));
-      }
-      let bytes = message(14, path);
-      let (_, found, ..) = decode_shape(&record(&bytes)).unwrap();
-      let path = found.unwrap();
-      assert_eq!(path.commands.len(), 5);
-      assert!(matches!(path.commands[1], FreeformPathCommand::Cubic {
-         control_1: FreeformPoint { x: 3.0, y: 4.0 },
-         control_2: FreeformPoint { x: 5.0, y: 6.0 },
-         point:     FreeformPoint { x: 7.0, y: 8.0 },
-      }));
-      assert!(matches!(path.commands[2], FreeformPathCommand::Close));
-      assert!(matches!(path.commands[3], FreeformPathCommand::Move { .. }));
-   }
-
-   #[test]
-   fn preserves_geometry_flips_and_affine_transform() {
-      let mut affine = float(1, 1.0);
-      affine.extend(float(2, 2.0));
-      affine.extend(float(3, 3.0));
-      affine.extend(float(4, 4.0));
-      affine.extend(float(5, 5.0));
-      affine.extend(float(6, 6.0));
-      let mut geometry = message(1, point(10.0, 20.0));
-      geometry.extend(message(2, point(30.0, 40.0)));
-      geometry.extend(float(3, 0.5));
-      geometry.extend(field(4, 0, &[1]));
-      geometry.extend(field(5, 0, &[0]));
-      geometry.extend(field(6, 0, &[1]));
-      geometry.extend(field(7, 0, &[0]));
-      geometry.extend(message(8, point(2.0, 3.0)));
-      geometry.extend(message(9, affine));
-      let bytes = message(1, geometry);
-      let (_, _, actual, _) = decode_shape(&record(&bytes)).unwrap();
-      assert_eq!(actual.frame.unwrap(), FreeformFrame {
-         x:        10.0,
-         y:        20.0,
-         w:        30.0,
-         h:        40.0,
-         rotation: 0.5,
+   fn native_shapes_decode_real_geometry_fill_shadow_and_paths() {
+      let archive = parse_native_archive(REAL).unwrap();
+      let shapes: Vec<_> = archive
+         .objects
+         .iter()
+         .map(|object| {
+            let common = Document::parse(object.region("commonCRDTData").unwrap().bytes)
+               .unwrap()
+               .root()
+               .unwrap()
+               .unwrap();
+            let specific = object
+               .region("specificCRDTData")
+               .and_then(|region| Document::parse(region.bytes).unwrap().root().unwrap());
+            decode_shape(common, specific, object.persistence_type).unwrap()
+         })
+         .collect();
+      let textbox = &shapes[0];
+      assert_eq!(textbox.geometry.frame.unwrap(), FreeformFrame {
+         x:        763.0,
+         y:        1226.5,
+         w:        0.0,
+         h:        0.0,
+         rotation: -0.0,
       });
-      assert_eq!(actual.horizontal_flip, Some(true));
-      assert_eq!(actual.vertical_flip, Some(false));
-      assert_eq!(actual.width_valid, Some(true));
-      assert_eq!(actual.height_valid, Some(false));
-      assert_eq!(actual.anchor, Some(FreeformPoint { x: 2.0, y: 3.0 }));
-      assert_eq!(actual.transform.unwrap().ty, 6.0);
+      assert_eq!(textbox.geometry.width_valid, Some(false));
+      assert_eq!(shapes[1].geometry.frame.unwrap().rotation, -std::f64::consts::FRAC_PI_4);
+      assert_eq!(shapes[1].style.stroke.as_ref().unwrap().width, 3.0);
+      assert_eq!(shapes[5].preset.as_deref(), Some("Parallelogram_950"));
+      for index in [3, 4, 5, 9] {
+         let Some(FreeformPaint::Solid { color }) = &shapes[index].style.fill else {
+            panic!("missing shape fill")
+         };
+         assert_eq!(color.hex.as_deref(), Some("#5AC4F6"));
+      }
+      let sticky = &shapes[7];
+      let Some(FreeformPaint::Solid { color }) = &sticky.style.fill else {
+         panic!("missing sticky fill")
+      };
+      assert_eq!(color.hex.as_deref(), Some("#FFE16C"));
+      assert_eq!(sticky.geometry.frame.unwrap().w, 200.0);
+      let shadow = &sticky.style.shadows[0];
+      assert_eq!(shadow.kind, "curved");
+      assert_eq!(shadow.radius, 15.0);
+      assert_eq!(shadow.curve, Some(f64::from(-0.123095_f32)));
+      assert_eq!(shadow.color.alpha, f64::from(0.35_f32));
+      assert_eq!(sticky.path.as_ref().unwrap().commands.len(), 6);
+      assert_eq!(shapes[10].style.shadows[0].opacity, Some(0.25));
    }
 
    #[test]
-   fn retains_fill_alpha_and_gradient_stops() {
-      let mut stop = float(1, 0.25);
-      stop.extend(float(2, 0.4));
-      stop.extend(message(3, color(0.1, 0.2, 0.3, 0.4)));
-      let mut gradient = message(1, point(0.0, 0.0));
-      gradient.extend(message(2, point(100.0, 0.0)));
-      gradient.extend(message(3, stop));
-      let style = message(1, gradient);
-      let bytes = message(1, style);
-      let (_, _, _, actual) = decode_shape(&record(&bytes)).unwrap();
-      let Some(FreeformPaint::LinearGradient { stops, .. }) = actual.fill else {
-         panic!("missing gradient")
+   fn captured_bezier_commands_preserve_zero_points_and_relative_controls() {
+      let archive = parse_native_archive(REAL).unwrap();
+      let common = Document::parse(archive.objects[3].region("commonCRDTData").unwrap().bytes)
+         .unwrap()
+         .root()
+         .unwrap()
+         .unwrap();
+      let path = path(
+         common
+            .property("b")
+            .unwrap()
+            .unwrap()
+            .field(1)
+            .unwrap()
+            .unwrap(),
+      )
+      .unwrap()
+      .unwrap();
+      assert_eq!(path.commands.len(), 7);
+      let FreeformPathCommand::Cubic { point, control_1, control_2 } = path.commands[1] else {
+         panic!("missing native circle curve");
       };
-      assert!((stops[0].color.alpha - 0.4).abs() < 1e-6);
-      assert!(matches!(stops[0].inflection, Some(value) if (value - 0.4).abs() < 1e-6));
-   }
-
-   #[test]
-   fn keeps_fill_and_stroke_colors_separate_with_line_style_and_shadow() {
-      let fill = color(1.0, 0.0, 0.0, 0.75);
-      let mut stroke = message(1, color(0.0, 0.0, 1.0, 0.5));
-      stroke.extend(float(2, 3.0));
-      stroke.extend(float(3, 4.0));
-      stroke.extend(float(3, 5.0));
-      stroke.extend(float(4, 2.0));
-      stroke.extend(message(5, b"round".to_vec()));
-      stroke.extend(message(6, b"bevel".to_vec()));
-      stroke.extend(float(7, 8.0));
-      stroke.extend(message(8, b"diamond".to_vec()));
-      stroke.extend(message(9, b"arrow".to_vec()));
-      let mut shadow = message(1, b"drop".to_vec());
-      shadow.extend(message(2, color(0.0, 1.0, 0.0, 0.25)));
-      shadow.extend(float(3, 1.0));
-      shadow.extend(float(4, 2.0));
-      shadow.extend(float(5, 3.0));
-      shadow.extend(float(6, 0.6));
-      let mut style = message(1, fill);
-      style.extend(message(2, stroke));
-      style.extend(float(3, 0.9));
-      style.extend(message(4, shadow));
-      let bytes = message(1, style);
-      let (_, _, _, actual) = decode_shape(&record(&bytes)).unwrap();
-      let Some(FreeformPaint::Solid { color: fill }) = actual.fill else {
-         panic!("missing fill")
-      };
-      let stroke = actual.stroke.unwrap();
-      let FreeformPaint::Solid { color: outline } = stroke.paint else {
-         panic!("missing stroke")
-      };
-      assert_eq!((fill.red, fill.blue), (1.0, 0.0));
-      assert_eq!((outline.red, outline.blue), (0.0, 1.0));
-      assert_eq!(stroke.dash, [4.0, 5.0]);
-      assert_eq!(stroke.tail_end.as_deref(), Some("diamond"));
-      assert_eq!(stroke.head_end.as_deref(), Some("arrow"));
-      assert_eq!(actual.shadows[0].color.green, 1.0);
-   }
-
-   #[test]
-   fn never_reads_ink_nodes_as_shape_outline() {
-      let mut node = field(1, 0, &[0]);
-      node.extend(message(2, point(4.0, 5.0)));
-      let mut bytes = b"com.apple.ink.pen".to_vec();
-      bytes.extend(message(14, message(1, node)));
-      assert!(decode_shape(&record(&bytes)).is_err(), "non-protobuf ink prefix is invalid");
-
-      let mut marked = Vec::new();
-      marked.extend(message(1, b"com.apple.ink.pen".to_vec()));
-      let mut ink_node = field(1, 0, &[0]);
-      ink_node.extend(message(2, point(4.0, 5.0)));
-      marked.extend(message(14, message(1, ink_node)));
-      assert!(decode_shape(&record(&marked)).unwrap().1.is_none());
+      assert_eq!(point, FreeformPoint { x: 128.0330047607422, y: 128.0330047607422 });
+      assert_eq!(control_1, FreeformPoint {
+         x: point.x + 29.289321899414062,
+         y: point.y - 76.77669525146484,
+      });
+      assert_eq!(control_2, FreeformPoint {
+         x: point.x + 29.289321899414062,
+         y: point.y - 29.289321899414062,
+      });
+      assert_eq!(path.horizontal_flip, Some(false));
+      assert_eq!(path.vertical_flip, Some(false));
+      assert!(path.natural_size.is_some());
    }
 }

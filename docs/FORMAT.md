@@ -1,385 +1,235 @@
-# Extracting Freeform Copy/Paste Data
+# Freeform pasteboard formats
 
-> How to read what Apple **Freeform** puts on the system pasteboard when you copy
-> board items, and how to turn it into something your app can import. Covers ink,
-> shapes, sticky notes / text boxes, connectors, tables, images, and groups.
->
-> **Status: reverse-engineered.** None of the `com.apple.freeform.*` types are
-> documented by Apple; there is no spec and no public header. Everything below
-> that is not a standard Apple API (`PKDrawing`, `PropertyListSerialization`) was
-> derived by inspecting real pasteboard payloads and the Freeform binary
-> (`/System/Applications/Freeform.app`, macOS 26.x). Treat the private formats as
-> **unstable across OS versions** and gate any decoder on a version check. Claims
-> marked `[inferred]` were reasoned from the binary's symbols/flags but not yet
-> verified against a fixture containing that shape.
+The native schemas below were checked against Freeform **5.1 (656.40.9.0.2)**
+and the Coherence framework shipped with macOS 27.2. They are private formats,
+not a stable Apple interchange specification. The Rust core does not require
+Apple frameworks; native APIs were used to establish reference behavior.
 
----
+## Pasteboard transport
 
-## 0. TL;DR — what to actually use
+Preserve the exact ordered UTI/byte pairs from one pasteboard change count:
 
-Freeform writes the same selection in several parallel representations. Preserve
-all of them: each tier has different stability and fallback value.
-
-| Need | Flavor | Library result |
-|---|---|---|
-| Pixels | `public.png` / `public.tiff` / PDF | ordered `FreeformRender` fallbacks |
-| Freehand ink | `com.apple.drawing` | local B-spline controls, affine transform, proven point channels, exact ink metadata, raw stroke record |
-| Item inventory | `com.apple.freeform.TSUDescription` | ordered classes and recursive typed hints |
-| Native scene | `com.apple.freeform.CRLNativeData` | record-bounded typed items plus retained unknown records |
-| Assets and routing state | `CRLAsset.*`, metadata/state/style/text flavors | exact bytes, correlation metadata, and typed known state |
-
-Apple's `PKDrawing(data:)` remains the highest-fidelity ink renderer. The pure
-Rust decoder does not call PencilKit: it preserves the private packed controls
-and every proven channel, but keeps unsupported channels in `rawData` rather
-than describing the result as a rendered sample.
-
-> **Tooling.** [`tools/dump_pasteboard.swift`](../tools/dump_pasteboard.swift)
-> captures an atomic flavor snapshot with an exact UTI manifest. The Rust and
-> npm packages decode that snapshot into independent tier outcomes; one damaged
-> flavor never discards another usable tier.
-
-`CRL` = Freeform's internal class prefix. The app is built on the iWork shared
-stack (the `TS*` frameworks: `TSUtility`, `TSAccessibility`, …), so the native
-format is iWork-TSP-flavoured protobuf + CRDT, not a clean public schema.
-
----
-
-## 1. How Freeform writes the pasteboard
-
-A single Freeform copy produces these pasteboard types (verified on a freehand
-selection; type *names* confirmed in the Freeform binary):
-
-```
-com.apple.freeform.CRLNativeMetadata     # tiny: paste UUID + flags
-com.apple.freeform.CRLNativeData         # the full native object graph (the big one)
-com.apple.freeform.TSUDescription        # binary plist: item-class manifest
-com.apple.freeform.pasteboardState.*     # boolean routing flags (see §5)
-com.apple.drawing                        # PKDrawing of all freehand ink (PencilKit)
-public.png / "Apple PNG pasteboard type" # flat render
-public.tiff / "NeXT TIFF v4.0 ..."       # flat render (large)
+```sh
+swift tools/dump_pasteboard.swift pb_dump
 ```
 
-Other types appear **conditionally** (confirmed as registered names in the
-binary; presence depends on the selection):
+| Flavor | Purpose |
+|---|---|
+| `com.apple.drawing` | Flattened PencilKit drawing |
+| `com.apple.freeform.CRLNativeData` | Native object tree |
+| `com.apple.freeform.CRLNativeMetadata` | Paste correlation metadata |
+| `com.apple.freeform.TSUDescription` | Ordered top-level classes and routing hints |
+| `com.apple.freeform.CRLAsset.<id>` | Embedded asset bytes |
+| `com.apple.freeform.pasteboardState.*` | Routing-state bytes |
+| `com.apple.freeform.stylepasteboard` | Style-only selection |
+| PNG, TIFF, PDF, plain text, RTF | Independent rendered/text representations |
 
-```
-com.apple.freeform.CRLAsset.<id>         # raw bytes of an EMBEDDED (non-premium) asset; absent for premium/stock media
-com.apple.freeform.stylepasteboard       # present for "Copy Style" (style only, no geometry)
-public.rtf / public.utf8-plain-text      # only when copying a TEXT SELECTION, not whole items [inferred]
-```
+Freeform's native data provider splits large native, metadata, and asset
+payloads into the base flavor followed by `.1`, `.2`, and subsequent numeric
+suffixes. Capture order is not chunk order. The decoder assembles contiguous
+chunks before parsing; missing or duplicate chunks fail their transport without
+discarding independent tiers. The final chunk has no separate transport marker,
+so the inner format must also validate completeness.
 
-`CRLNativeMetadata` is `[8-byte LE length][protobuf]`; the protobuf carries the
-**paste UUID** (16 bytes, big-endian) which also appears as `id` in
-`CRLNativeData`'s index plist (§4). Use it to correlate the blobs.
+Asset identifiers can themselves end in numbers. Native asset descriptors
+resolve ambiguous asset continuations; the decoder does not guess from a suffix
+alone. Original flavor order and bytes remain in `FreeformPasteboard.flavors`.
+Dump-tool aliases with underscores are accepted alongside exact UTIs.
 
----
+## Native archive framing
 
-## 2. Enumerate the pasteboard (Swift)
+Every serialized object, including the pasteboard root, has this layout:
 
-There is no first-class CLI for non-text types; `pbpaste` only sees text. Use
-`NSPasteboard` directly:
-
-```swift
-import AppKit
-let pb = NSPasteboard.general
-print("changeCount:", pb.changeCount)
-for t in pb.types ?? [] {
-    let n = pb.data(forType: t)?.count ?? 0
-    print(String(format: "%12d  %@", n, t.rawValue))
-}
-```
-
-Run with `swift file.swift`. Dump any type to disk with
-`pb.data(forType: NSPasteboard.PasteboardType("com.apple.drawing"))?.write(to:)`.
-
-> `osascript -e 'clipboard info'` shows the classic flavor types (PNG/TIFF/…) but
-> **not** the reverse-DNS `com.apple.freeform.*` ones — use the Swift enumeration.
-
----
-
-## 3. Extraction tiers
-
-### 3.1 Raster fallback — `public.png` / `public.tiff`
-
-Flat, pre-rendered, transparent background. The PNG can be enormous (a sample
-was 8840×10800). Only useful as a thumbnail or last resort. **Avoid** the TIFF
-(it was ~380 MB uncompressed for the same selection).
-
-### 3.2 Ink — `com.apple.drawing` is a `PKDrawing` (RECOMMENDED)
-
-Freeform flattens **all** `CRLFreehandDrawingItem`s in the selection into one
-PencilKit `PKDrawing` and puts it on `com.apple.drawing`. This is the single
-best path for ink because `PKDrawing` is a **public, stable** API:
-
-```swift
-import PencilKit
-let data = try Data(contentsOf: drawingURL)        // com.apple.drawing bytes
-let drawing = try PKDrawing(data: data)
-for stroke in drawing.strokes {
-    let t = stroke.transform                        // CGAffineTransform — REQUIRED
-    for p in stroke.path.interpolatedPoints(by: .parametricStep(0.5)) {
-        let loc = p.location.applying(t)            // canvas-space point
-        _ = (loc, p.size.width, p.force, p.opacity, p.azimuth, p.altitude)
-    }
-    _ = (stroke.ink.inkType, stroke.ink.color)      // .pen/.pencil/.marker, color
-}
+```text
+[u64 little-endian ObjectInfo length]
+[CRLProto.ObjectInfo protobuf]
+[named data regions, in directory order]
+[each referenced child object, recursively, in reference order]
 ```
 
-**Load-bearing details (verified):**
+`ObjectInfo` fields established by Freeform's generated protobuf name map:
 
-- **`stroke.transform` is mandatory.** Each stroke's path points are in
-  *stroke-local* coordinates near the origin; the transform places (and may
-  scale/rotate) the stroke on the canvas. Skip it and every stroke collapses to
-  the top-left corner. Scale strokes' width by `sqrt(|a·d − b·c|)` of the
-  transform if you flatten to a constant width.
-- **Pressure is per-point** (`force`, plus `size.width`). SVG `stroke-width` is
-  per-path, so a faithful export needs either one `<path>` per stroke at mean
-  width (cheap, fine for thin pens) or a variable-width filled outline (use
-  e.g. **perfect-freehand**, fed the `{x, y, pressure}` stream).
-- `stroke.path` is a B-spline of control points; `interpolatedPoints(by:)`
-  samples the rendered curve. `.parametricStep(0.5)` is a good density/size
-  trade-off.
-- Bounds come from `drawing.bounds`; ink color was sRGB, inkType `.pen` in the
-  sample.
+| Field | Meaning |
+|---|---|
+| 1 | Persistence type |
+| 2 | Minimum required version, repeated uint32 components |
+| 3 | Child object references, including UUIDs |
+| 4 | Asset references |
+| 5 | Data directory entries: field 1 name, field 2 byte size |
+| 6 | Object-option flags |
+| 7 | Version required for good-enough fidelity |
+| 8 | Version required for full fidelity |
+| 9 | Persistence subtype |
 
-A reference `PKDrawing → SVG` conversion (one `<path>` per stroke, transform
-applied, mean pressure-width, round caps) round-trips 1218 strokes into an
-~830 KB SVG that matches the original visually 1:1.
+The pasteboard root has persistence type 99. Its `objectData` region is a binary
+plist containing `id`, `isSmartCopyPaste`, and ordered `boardItems` UUIDs. Those
+UUIDs must match the root child references.
 
-### 3.3 Inventory — `com.apple.freeform.TSUDescription`
+A directory entry supplies the **exact boundary** of its payload. Neither a
+search for a binary-plist trailer nor a scan for `crdt` markers is needed to
+frame the archive. Marker bytes inside a payload have no framing significance.
+The parser rejects truncated regions, duplicate directory names or object IDs,
+reference/index disagreement, and bytes beyond the declared object tree.
 
-A **binary plist** — a per-item *hint manifest*. Parse with `plutil -p` or
-`PropertyListSerialization`:
+Known directory keys are `objectData`, `commonCRDTData`, `specificCRDTData`,
+`capsuleData`, `alternateCommonCRDTData`, and `alternateSpecificCRDTData`.
+Unknown named regions remain available through `recordRanges` into `rawArchive`.
+Ranges include the original payload headers. The obsolete duplicated per-item
+`rawData` is replaced by these named ranges.
 
-```
-{ "appData": {…},
-  "boardItems": [
-    { "class": "Freeform.CRLWPShapeItem", "textbox": true, "text": [ {} ] },
-    { "class": "Freeform.CRLWPStickyNoteItem",
-      "text": [ { "hasText": true, "hasVisibleText": true } ] },
-    { "class": "Freeform.CRLConnectionLineItem" },
-    { "class": "Freeform.CRLTableItem", "disallowAnchoringToCRLTable": true },
-    { "class": "Freeform.CRLImageItem", "containsPremiumContent": true },
-    … ] }
-```
+Nested objects are not top-level pasteboard items. In the real mixed capture,
+the table owns a separately serialized shape. It is exposed through
+`table.children`, with a parent UUID and an explicit cell anchor.
 
-Besides `class`, each entry carries cheap routing hints: `textbox` (text box vs
-labeled shape), `text[].hasText` / `hasVisibleText`, `disallowAnchoringToCRLTable`,
-`containsPremiumContent`. **Crucially, this `boardItems` array is the same length
-and order as `CRLNativeData`'s index `boardItems` (§3.4-B)** — zip them to attach
-a class + hints to each item UUID without touching the CRDT graph. (Verified on a
-10-item mixed paste.)
+## Coherence documents
 
-### 3.4 Full native — `com.apple.freeform.CRLNativeData`
+Known CRDT payloads begin with `crdt` and a little-endian uint32 encoding version;
+this decoder handles versions 6 and 7. The body is a `Proto_Document` protobuf.
 
-This holds the real object graph (geometry, text, style, connector endpoints,
-asset refs). **Layout, verified on freehand (5-item), mixed (10-item), and table (1-item) pastes:**
+| Document field | Meaning |
+|---|---|
+| 1 | Inline CRDT root |
+| 3 | Capsule root reference |
+| 4 | Capsule reference records |
+| 6 | Document-local constant tables |
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│ A. Manifest    [8-byte LE length][protobuf CRLProto.ObjectInfo]      │
-│      1 persistenceType (varint, 99 on the pasteboard)                │
-│      2 minRequiredVersion (repeated uint32: dotted components)       │
-│      3 childObjectReferences: { 1: { 1: 16-byte item UUID } },       │
-│        one per top-level board item                                  │
-│      4 assetReferences   5 dataDirectoryEntries ("objectData", len)  │
-│      6 objectOptions (varint flags, 7)                               │
-│      7 minRequiredVersionForGoodEnoughFidelity (repeated uint32)     │
-├────────────────────────────────────────────────────────────────────┤
-│ B. Index plist (binary plist, bounded — NOT to EOF)                  │
-│      { id: "<paste UUID>",                                           │
-│        isSmartCopyPaste: Bool,                                       │
-│        boardItems: ["<item UUID>", …] }   // UUID strings, ordered   │
-├────────────────────────────────────────────────────────────────────┤
-│ C. Object archive (rest of the blob)                                 │
-│      A CRDT object graph (strings "commonCRDTData"/"specificCRDTData"│
-│      appear inline). Records are protobuf (iWork-TSP/`CRLProto_*`     │
-│      messages, e.g. `CRLProto_ObjectMetadata`), keyed by 16-byte     │
-│      UUIDs, with HETEROGENEOUS framing (mixed 8-byte-LE-length-       │
-│      prefixed records and inline sub-messages). Ink references appear │
-│      as `com.apple.ink.pen`; stroke geometry is duplicated here.     │
-└────────────────────────────────────────────────────────────────────┘
-```
+Constants contain packed UUIDs, repeated strings, and repeated opaque data.
+References must be resolved against their own document, never a neighbouring
+record. Capsule reference key paths select records in the document's object pool.
 
-**Parsing notes:**
+A CRDT composite has string keys and CRDT values. A CRRegister contains a
+timestamp and a separately tagged CRValue. Custom CRValues use integer coding
+keys; omitted key arrays denote dense zero-based order. The decoder distinguishes
+these representations rather than recursively looking for plausible floats,
+strings, or UUID-shaped bytes.
 
-- Field names and order come from Freeform's own protobuf name map for
-  `CRLProto.ObjectInfo`. Versions are Freeform releases as component lists:
-  Freeform 5.1 copies declare minimum `[1]` and good-enough fidelity `[2, 4]`.
-  `FreeformCompatibility` is `supported` when the newer of the two is at most
-  2.4, the newest version the decoders are verified on, and `unsupported`
-  above it; field 6 (`objectOptions`, `7`) is flags, not a version.
-- Section B does **not** run to EOF. Don't hand the whole blob to a plist
-  parser — it reads the wrong 32-byte trailer and dies. Find the bplist trailer
-  (5 zero bytes, then `offsetIntSize∈1..8`, `objectRefSize∈1..8`, a sane
-  `numObjects`, and `offsetTableOffset` inside the slice), slice to it, then
-  parse just that slice.
-- The 16-byte UUIDs are big-endian raw bytes; format as
-  `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX`. The paste `id` in B equals the UUID in
-  `CRLNativeMetadata`.
-- Section C is **CRDT-encoded** (Freeform is collaborative — even a copy carries
-  CRDT bookkeeping). Inline markers: `commonCRDTData`, `specificCRDTData`, and
-  4-byte `crdt`/`bcrdt`/`dcrdt`/`fcrdt` tags fronting length-prefixed CRDT blobs.
-  Verified recoverable as plain strings: shape **preset names** (e.g.
-  `Parallelogram_950`), **font ids** (`com.apple.Freeform.system.font.regular` /
-  `.semibold`), **text-style keys** (`fontSize`, `bold`, `paragraphAlignment`,
-  `baseWritingDirection`, `characterFill`, `listStyle`, `capsuleData`), and
-  **asset references** (`<UUID>.jpg`, `thumbnail`).
-- **Text content *and* styling DECODE** — they're plain iWork `TSWP` protobuf; the
-  CRDT blobs (`commonCRDTData`/`specificCRDTData`) are separate bookkeeping, not a
-  lock. The text-storage message parses directly:
-  - field **1** = the **UTF-8 string**, contiguous (verified: cell text `"aaa"`
-    reads straight out — the earlier "interleaved/uncrackable" claim was **wrong**).
-  - a character **property table** of `{propID → value}` runs. Verified by value:
-    `propID 10` = **fontSize** (f32 points, e.g. `72`); `propID 9` = **characterFill**.
-    Still unlabelled (values present, names need a one-property diff): `bold`,
-    `paragraphAlignment`, `listStyle`, `baseWritingDirection`.
-  - **Colors are sRGB**, encoded as three `#15 fixed32` channels nested under a
-    `#14` colorspace wrapper (model index `0` = sRGB), optional alpha — NOT a flat
-    RGB triple, which is why a naïve float scan misses them. Verified: pink
-    `#EB539F` = `(0.922, 0.325, 0.624)`, blue `#5AC4F6` = `(0.353, 0.769, 0.965)`.
-- Geometry (position/size/transform) and connector endpoints still need per-shape
-  diffing (§8) before you trust the field numbers — but fills / text / size are solved.
+Supported CRValue alternatives include unsigned and zigzag-signed integers,
+float32/float64, constant-table strings and UUIDs, opaque data, optionals,
+repeated values, custom values, and capsule references. Ordered collections
+use their sequence structure and timestamps; table axes are not inferred from
+reference-record order.
 
-### 3.5 Worked round-trip: native → vector SVG (verified)
+## Native item semantics
 
-A 2×2 table copy (`hasOnlyTableBoardItems`) was rebuilt as vector SVG **purely
-from the decoded `CRLNativeData`** — no PencilKit, no tracing the raster.
-What came out of the bytes, and how it cross-checked
-against Freeform's own PNG:
+| Persistence type | Item |
+|---|---|
+| 2, subtype 0 or absent | Group |
+| 2, subtype 1 | Table |
+| 2, subtype 2 | Surface container; raw payloads retained |
+| 3 | Word-processing shape/text box |
+| 4 | Connector |
+| 5–9 | Image, movie, file, URL, USDZ |
+| 10 | Freehand drawing container |
+| 11 | Freehand drawing shape/stroke |
+| 12 | Sticky note |
 
-| Quantity | From native decode | Confirmed in render (2 px/pt) |
-|---|---|---|
-| Column width | `344` pt | divider at 688 px = 2×344 |
-| Bottom row height | `258` pt | 516 px |
-| Embedded square | `150×150` pt at cell offset `(97, 109.5)` pt | 299×299 px at the matching spot |
-| Pink text | `fontSize 72`, fill `#EB539F` | 144 px tall, exact hue |
-| Cell text | `"aaa"` ×3 (TSWP field 1) | matches |
-| Grid / cell fill | `#BFBFBF` / `#FFFFFF` | matches |
+Native discriminators drive decoding even without TSU. TSU is decoded
+independently and joined only after correlation. Its `textbox: true` hint
+refines a `CRLWPShapeItem` into a text box. Other shapes retain their styled
+labels in `Shape.text`.
 
-Takeaways: **the render scale is a clean 2 px/pt (Retina)**; geometry *is* present
-in the blob as f32 points (column/row sizes, the square's frame), not just
-inferable from pixels; and text + color + size all decode. The one cell whose
-`fontSize` wasn't decoded (the small black labels) used the cell default, read
-off the raster as ~17 pt. (Separately, the mixed fixture's sticky note decoded
-its text `"hi"` and yellow fill `#FFE16C` — so note/label text content is
-recoverable too.)
+### Geometry, paths, and styles
 
----
+Common CRDT data carries object identity, parent affinity, and shadow state.
+Parent affinity supplies native geometry; shape-derived affinities also carry
+path-source data. Geometry includes position, size, width/height validity, and
+flips. Clockwise archived degrees become negative radians. Zero-sized autogrowing
+text-box geometry is retained rather than replaced with a guessed frame.
 
-## 4. Board-item catalogue
+Bézier paths decode their native command records, including endpoint-relative
+Float16 cubic controls. Parametric point/scalar/callout paths retain their native
+controls in `FreeformPath.source`; they are not replaced with invented curves.
+Path-local flips remain distinct from item-geometry flips.
 
-The board-item classes Freeform can place on the pasteboard (names from the
-binary; `Freeform.<Class>` is the form used in `TSUDescription`):
+Native fills in this schema are color fills, not the previously assumed gradient
+or image-fill messages. Colors preserve RGB, CMYK, or monochrome components and
+the source color space. `hex` is available only when sRGB conversion is
+established; device CMYK and Display P3 are not mislabeled as sRGB.
 
-| Class | What it is | Where the data lives | Practical extraction |
-|---|---|---|---|
-| `CRLFreehandDrawingItem` | Pen/pencil/marker ink | `com.apple.drawing` (flattened) **and** `CRLNativeData §C` | **Tier 2 `PKDrawing`** — lossless |
-| `CRLFreehandDrawingShapeItem` | Ink auto-recognized into a shape `[inferred]` | `CRLNativeData §C` | native decode |
-| `CRLShapeItem` | Geometric shape with **no** text (rectangle, oval, line, polygon, library shapes) `[inferred]` | `CRLNativeData §C` (preset name + transform + fill/stroke) | native decode |
-| `CRLWPShapeItem` ✓ | **Text box or labeled shape.** `TSUDescription` `textbox:true` ⇒ text box; else a shape carrying text. Preset name in §C (e.g. `Parallelogram_950`) | `CRLNativeData §C` (preset + transform + fill/stroke + TSWP text) | native decode; text + fill + size decode (§3.4) |
-| `CRLWPStickyNoteItem` ✓ | **Sticky note** — square note with text | `CRLNativeData §C` (transform + fill + TSWP text) | native decode; text + fill + size decode (§3.4) |
-| `CRLConnectionLineItem` ✓ | **Connector / arrow** | `CRLNativeData §C` (endpoints bind to item UUIDs; routing straight/orthogonal/curved) | native decode |
-| `CRLTableItem` ✓ | **Table — self-contained.** Copying a table = **one** board item (`hasOnlyTableBoardItems`); cell text **and embedded shapes** are nested in its §C record, *not* sibling items | `CRLNativeData §C` (per-cell `TSWP` text + nested shape objects, each with its own `commonCRDTData`) | native decode; verified — cell text, font size, and fills (incl. an embedded square `#5AC4F6`) all decode |
-| `CRLImageItem` ✓ | **Image** | §C references the asset by `<UUID>.<ext>` + a `thumbnail`; bytes arrive on `com.apple.freeform.CRLAsset.<id>` **only when not premium** | pull `CRLAsset.*` blob; premium/stock ⇒ reference only, use `public.png` |
-| `CRLMovieItem` / `CRLMediaItem` | Video / media | `CRLAsset.<id>` blob `[inferred]` | pull the asset blob |
-| `CRLImagePlaygroundItem` | Image-Playground image | as `CRLImageItem` `[inferred]` | pull the asset blob |
-| `CRLGroupItem` | Group container `[inferred]` | `CRLNativeData §C` (holds child UUID refs) | recurse into children |
+Stroke styles retain native cap/join/line-end settings, smart or PencilKit brush
+configuration, and separate brush-pattern offsets. Dash lengths and phase are
+**factors of rendered stroke width**, not absolute point measurements. Rendering
+round-dot patterns additionally requires the native cap/screen-scale behavior.
 
-> **Sticky note vs text box vs shape (verified).** A **sticky note** is its own
-> class (`CRLWPStickyNoteItem`). A **text box** and a **labeled shape** are both
-> `CRLWPShapeItem`, told apart by `TSUDescription`'s `textbox` flag. A plain
-> `CRLShapeItem` (no text) also exists. The `…NativeTextBoxItems` state flags
-> track the text-box case. `✓` rows above were confirmed against a real paste.
+### Text and tables
 
----
+Text storage is `CRAttributedString`, not a flat board-item protobuf string.
+Its content and instructional text are separate. Consecutive UTF-16 attribute
+ranges are converted to UTF-8 byte offsets; invalid surrogate boundaries fail
+rather than shifting formatting onto another character. Presets and explicit
+attributes populate font, size, decorations, fill, alignment, writing direction,
+lists, and hyperlinks. Native text inset is a scalar point measurement.
 
-## 5. `pasteboardState.*` flags — route without parsing
+A table's `capsuleData` holds ordered row/column dictionaries and a sparse cell
+dictionary, whose values reference records in the capsule. Missing cells are
+materialized with native defaults. Cell IDs are `ROWUUID/COLUMNUUID` strings.
+Table-wide fill, stroke, border options, rounded-corner, autogrow, and direction
+flags remain separate from individual cell styles.
 
-Freeform writes boolean flag types you can probe cheaply (presence/value) to
-branch before doing any heavy decode. Verified flag names in the binary:
+An anchored child's `tableAnchor` retains its cell ID and **cell-local geometry**.
+The normal item geometry remains parent-table-local. Cells reference their
+anchored children by UUID; no geometry is assigned by byte proximity.
 
-```
-hasNativeBoardItems              hasNativeText
-hasFreehandDrawingBoardItems     hasOnlyFreehandDrawingBoardItems
-hasNativeBoardItemsContainingText
-hasSingleNativeImageBoardItem    hasSingleNativeMovieBoardItem
-hasOnlyNativeTextBoxItems        hasSingleNativeTextBoxItem
-hasOnlyTableBoardItems           hasSingleTableBoardItem
-hasUnsupportedCRLTableContent    hasNativeTypes
-hasTextStoragesAttachmentsNotAllowed
-```
+### Graphs, assets, and native ink
 
-Names use the `com.apple.freeform.pasteboardState.` prefix; premium content uses
-`com.apple.apps.pasteboardState.TSAPasteboardStateTypeHasPremiumContent`. Probe
-presence/value to branch before any heavy decode. Examples:
-`hasOnlyFreehandDrawingBoardItems` ⇒ ignore `CRLNativeData`, take the `PKDrawing`;
-`hasSingleNativeImageBoardItem` ⇒ grab `public.png` / the `CRLAsset` blob and skip
-the graph; `…HasPremiumContent` ⇒ expect missing asset bytes (reference only).
+Connector attachments are UUID registers plus inherited shape geometry/path
+state. Free endpoints, routing, line ends, and flips come from those native
+structures. Groups expose ordered child references and recursively decoded
+children; freehand containers use the same nonduplicative graph representation.
 
----
+Media descriptors use exact asset identifiers, not the owning board-item UUID.
+Captured `CRLAsset` bytes join those identifiers after semantic decoding.
+Premium assets can legitimately have no embedded bytes. USDZ placement matrices
+and model-orientation quaternions are separate values.
 
-## 6. Recommended import pipeline
+Native ink combines its shape path with `CRLProto_PKStrokePathData` delta
+channels and mask. Unchanged channels reuse the previous native value. Genuine
+PencilKit drawing payloads reuse the PencilKit decoder. Recognized shapes without
+PencilKit stroke data retain their decoded paths/styles as shapes.
 
-1. Capture an atomic snapshot with `tools/dump_pasteboard.swift`. The generated
-   `manifest.json` is authoritative for UTI names, flavor order, filenames, and
-   `changeCount`.
-2. Pass every exact UTI/byte pair to `decodePasteboard`; do not pre-collapse
-   dynamic assets or state flags into fixed slots.
-3. Check each `FreeformTier`: `decoded`, `failed`, or `absent`. Keep TSU,
-   native, drawing, and rendered fallbacks independent.
-4. Treat `com.apple.drawing` as the canonical ink source when it decodes.
-   Points are local B-spline controls; apply the preserved affine transform or
-   sample the spline before rendering.
-5. Use the strictly correlated TSU/native result for non-ink items. Item kinds
-   retain geometry/style, paths, styled text, connector endpoints, table cells,
-   assets/media, group relationships, and bounded raw data for unsupported
-   fields.
-6. Resolve `CRLAsset.<id>` bytes through `FreeformNative.assets`. A missing
-   payload with premium state is expected; an unmatched or truncated asset is a
-   diagnostic rather than an invented image.
-7. Fall back to the ordered render flavors when native compatibility or a tier
-   failure prevents the required fidelity.
+## PencilKit drawing bytes
 
----
+`com.apple.drawing` begins with `wrd`; stroke points are packed according to
+separate per-point and constant-channel bitmasks. There is **no universal point
+stride**. Constant channels are applied before variable channels, and masks,
+counts, and lengths must agree.
 
-## 7. Caveats
+Decoded channels include local coordinates, time, width/height, pressure,
+opacity, azimuth, altitude, secondary scale, threshold, and edge width. Points
+remain spline controls; apply the preserved affine transform or use Apple's
+`PKDrawing` API to obtain rendered samples. Bounds are unions of archived
+canvas-space render bounds, not extrema of control points. Explicit random seeds
+are retained; unproven identity-derived seeds are not fabricated.
 
-- **Unstable native schema.** The decoder validates the CRL envelope, index,
-  manifest, UUIDs, record ownership, and known compatibility metadata before
-  semantic decoding. Unsupported record fields remain in `rawData`.
-- **CRDT object graph.** Section C contains references and nested collaboration
-  records. Values are associated only inside bounded owner records, never by
-  nearest byte offset.
-- **Private PencilKit bytes.** PencilKit's framework API is version-tolerant;
-  the Rust byte decoder is a versioned reverse-engineered subset with raw
-  fallback for unproven channels.
-- **Partial transfer.** Universal Clipboard may leave only TSU or a render.
-  Independent tier outcomes preserve those useful fallbacks.
-- **Premium media.** Premium image/movie items can carry descriptors and a
-  render without a `CRLAsset` payload. Absence is represented explicitly.
+Masked and erased strokes keep one stroke record (field 5) with the shared path
+and list each visible stroke as a substroke in field 11. Every substroke is a
+separate `PKStroke`: its ink, transform, and flags override the record's when
+present and inherit them otherwise; its render bounds are its own. Substroke
+field 10 holds closed mask polygons as stroke-local float32 `(x, y)` pairs, and
+field 12 holds visible parametric ranges as consecutive inclusive `(start, end)`
+values; every capture so far holds one range per substroke, so the pairing of
+several ranges is inferred. An eraser splits one record into several substrokes
+that all reference the full path.
 
----
+## Verification and fidelity boundaries
 
-## 8. Producing fixtures & verifying new shape types
+The checked-in mixed-board capture exercises text-box routing, styled sticky
+text, fills, paths, connector geometry, image references, table defaults/styling,
+and a nested cell-anchored shape. PencilKit captures include varied channels,
+noncircular sizes, nontrivial transforms, constant templates, and masked and
+erased substrokes cross-checked against Apple's public API.
 
-The reliable way to nail §3.4/§4 for a given shape is **differential analysis**:
+`FreeformCompatibility` takes the maximum minimum/good-enough-fidelity requirement
+across the complete object tree. The captured root declares 2.4, but its table
+requires 4.2 and premium image requires 4.4; reporting only the root's version
+would hide those requirements. This gate is **not a promise of complete rendering
+parity**.
+Unknown item kinds and fields retain raw data; unsupported known encodings fail
+explicitly. Fonts/layout, parametric path generation, color-profile conversion,
+brush rendering, and unprojected newer fields may require a renderer or a
+PNG/TIFF/PDF fallback. The decoder does not merge collaborative editing deltas
+or implement Freeform's rendering engine.
 
-1. In Freeform, put exactly one shape on a board, select it, copy.
-2. Dump every pasteboard type to disk (§2), tagged by shape kind.
-3. Change **one** property (color, then position, then text) and re-dump; diff
-   the `CRLNativeData §C` bytes to localize each field.
-4. Repeat per shape kind: rectangle, oval, sticky note, text box, arrow/
-   connector, table, image, group.
-
-**Verified by the checked-in real and synthetic fixtures:** strict A/B/C
-envelope parsing; canonical UUID and manifest/index reconciliation; independent
-TSU parsing and recursive hints; bounded item dispatch; local geometry and
-flips; preset and Bézier path retention; solid/gradient style records; native
-ink channels and transforms; connector/group references; styled text and table
-cell structure; media descriptors and dynamic asset joins; and lossless raw
-fallbacks for fields not yet mapped.
-
-New OS releases and shape-specific fields still require differential captures:
-change one property, capture atomically, and add the resulting record mapping
-only when its ownership, wire type, and semantics are independently established.
+When adding a mapping, change one property in Freeform, capture all flavors,
+and compare against the native serializer or API. Synthetic data is useful for
+malformed-input regressions, but cannot establish a private schema by itself.

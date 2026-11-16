@@ -40,10 +40,11 @@ pub mod crl;
 pub mod decode;
 pub mod pkdrawing;
 pub mod types;
+mod wire;
 
 pub use crl::{decode_crl_native, join_crl_tsu, parse_tsu_description};
 pub use decode::{BlobKind, classify_blob, decode_pasteboard, has_freeform_content};
-pub use pkdrawing::{PK_POINT_STRIDE, decode_pk_drawing, is_pk_drawing};
+pub use pkdrawing::{decode_pk_drawing, is_pk_drawing};
 pub use types::*;
 
 // The npm package builds this exact crate with `--features wasm` for
