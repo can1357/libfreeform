@@ -281,11 +281,15 @@ export interface FreeformBoardItem {
   readonly recordRanges: readonly FreeformRecordRange[];
   readonly rawData: Uint8Array;
 }
-/** Compatibility of a decoded native archive. */
+/**
+ * Compatibility of a decoded native archive: the Freeform version it needs
+ * (dotted components, `[2, 4]` is 2.4) and whether the decoders are verified
+ * on archives needing it.
+ */
 export type FreeformCompatibility =
   | { readonly kind: 'unknown' }
-  | { readonly kind: 'supported'; readonly version: number }
-  | { readonly kind: 'unsupported'; readonly minimumVersion: number };
+  | { readonly kind: 'supported'; readonly version: readonly number[] }
+  | { readonly kind: 'unsupported'; readonly version: readonly number[] };
 /** Everything recovered from CRLNativeData and correlated flavors. */
 export interface FreeformNative {
   readonly pasteId: string;

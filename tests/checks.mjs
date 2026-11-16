@@ -187,6 +187,7 @@ export function runChecks(api, fixtures) {
 
   check('rich item variants carry geometry, style, and tagged data', () => {
     const native = api.decodeCrlNative(realBoardNative, realBoardTsu);
+    assertEq(native.compatibility, { kind: 'supported', version: [2, 4] }, 'compatibility');
     assertEq(native.items.length, 10, 'board item count');
     const sticky = native.items[7];
     assert(sticky.geometry.frame != null, 'item local geometry');

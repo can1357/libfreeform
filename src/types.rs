@@ -677,7 +677,14 @@ pub struct FreeformBoardItem {
    pub raw_data:      Vec<u8>,
 }
 
-/// Compatibility of a decoded native archive.
+/// Compatibility of a decoded native archive, from the Freeform versions its
+/// manifest declares.
+///
+/// A version is a list of dotted components (`[2, 4]` is Freeform 2.4). An
+/// archive needs the newer of its minimum version and its version for
+/// good-enough fidelity; it is supported when the decoders have been verified
+/// on archives needing that version (2.4, the version copies from Freeform 5.1
+/// declare).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(
    feature = "serde",
@@ -685,13 +692,14 @@ pub struct FreeformBoardItem {
    serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")
 )]
 pub enum FreeformCompatibility {
-   /// Version metadata was not recoverable.
+   /// The manifest declares no Freeform version.
    #[default]
    Unknown,
-   /// The archive version is fixture-verified.
-   Supported { version: u64 },
-   /// The archive requires a newer decoder.
-   Unsupported { minimum_version: u64 },
+   /// The archive needs Freeform `version`, which the decoders are verified on.
+   Supported { version: Vec<u32> },
+   /// The archive needs Freeform `version`, newer than the decoders are
+   /// verified on: its records may use layouts they misread or skip.
+   Unsupported { version: Vec<u32> },
 }
 
 /// Everything recovered from `CRLNativeData` and its correlated flavors.

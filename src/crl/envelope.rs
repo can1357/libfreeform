@@ -7,6 +7,7 @@
 //! proximity.
 
 use std::{
+   cmp::Ordering,
    collections::{BTreeSet, HashMap},
    ops::Range,
 };
@@ -19,6 +20,11 @@ use crate::{
 const BPLIST_HEADER: &[u8; 8] = b"bplist00";
 const CRDT_TAG: &[u8; 4] = b"crdt";
 const NIL_UUID: [u8; 16] = [0; 16];
+
+/// The newest Freeform version an archive may need for the decoders to read
+/// it: Freeform 5.1's copies of shapes, connectors, sticky notes, tables,
+/// images and freehand drawings all need 2.4 for good-enough fidelity.
+const VERIFIED_VERSION: &[u32] = &[2, 4];
 
 /// A bounded CRDT object record whose owner was established by metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,41 +315,75 @@ fn parse_index(index: &[u8]) -> Result<(String, Vec<String>), FreeformDecodeErro
    Ok((parse_uuid(paste_id, "index id")?, item_ids))
 }
 
+/// Parses the manifest, Freeform's `CRLProto.ObjectInfo`: the item references
+/// (field 3) and the Freeform versions the archive needs, at minimum (field 2)
+/// and for good-enough fidelity (field 7), each a repeated `uint32` of dotted
+/// components. The persistence type (1), asset references (4), data directory
+/// (5) and object options (6) are not needed to decode.
 fn parse_manifest(
    manifest: &[u8],
 ) -> Result<(Vec<[u8; 16]>, FreeformCompatibility), FreeformDecodeError> {
    let fields = parse_fields(manifest).map_err(|()| invalid("manifest protobuf is malformed"))?;
-   let mut schema = None;
-   let mut minimum_version = None;
+   let mut minimum = Vec::new();
+   let mut fidelity = Vec::new();
    let mut references = Vec::new();
    for field in fields {
       match (field.number, field.value) {
-         (1, WireValue::Varint(value)) => {
-            if schema.replace(value).is_some() {
-               return Err(invalid("manifest repeats schema version"));
-            }
-         },
-         (1, _) => return Err(invalid("manifest schema version has wrong wire type")),
+         (2, value) => push_components(&mut minimum, value, "minimum version")?,
          (3, WireValue::Bytes(value)) => {
             references.push(manifest_reference(value, references.len())?);
          },
          (3, _) => return Err(invalid("manifest item reference has wrong wire type")),
-         (6, WireValue::Varint(value)) => {
-            if minimum_version.replace(value).is_some() {
-               return Err(invalid("manifest repeats minimum version"));
-            }
-         },
-         (6, _) => return Err(invalid("manifest minimum version has wrong wire type")),
+         (7, value) => push_components(&mut fidelity, value, "good-enough fidelity version")?,
          _ => {},
       }
    }
-   let compatibility = match minimum_version {
-      Some(minimum_version) => FreeformCompatibility::Unsupported { minimum_version },
-      None => schema.map_or(FreeformCompatibility::Unknown, |version| {
+   let needed = [minimum, fidelity]
+      .into_iter()
+      .filter(|version| !version.is_empty())
+      .max_by(|a, b| compare_versions(a, b));
+   let compatibility = match needed {
+      None => FreeformCompatibility::Unknown,
+      Some(version) if compare_versions(&version, VERIFIED_VERSION).is_le() => {
          FreeformCompatibility::Supported { version }
-      }),
+      },
+      Some(version) => FreeformCompatibility::Unsupported { version },
    };
    Ok((references, compatibility))
+}
+
+/// Appends one occurrence of a repeated `uint32` version field, packed or not.
+fn push_components(
+   version: &mut Vec<u32>,
+   value: WireValue<'_>,
+   what: &str,
+) -> Result<(), FreeformDecodeError> {
+   let malformed = || invalid(format!("manifest {what} is malformed"));
+   match value {
+      WireValue::Varint(component) => {
+         version.push(u32::try_from(component).map_err(|_| malformed())?);
+      },
+      WireValue::Bytes(packed) => {
+         let mut offset = 0;
+         while offset < packed.len() {
+            let (component, next) = read_varint(packed, offset).map_err(|()| malformed())?;
+            version.push(u32::try_from(component).map_err(|_| malformed())?);
+            offset = next;
+         }
+      },
+      WireValue::Fixed64 | WireValue::Fixed32 => {
+         return Err(invalid(format!("manifest {what} has wrong wire type")));
+      },
+   }
+   Ok(())
+}
+
+/// Orders dotted versions, missing components as zero (2.4 = 2.4.0).
+fn compare_versions(a: &[u32], b: &[u32]) -> Ordering {
+   (0..a.len().max(b.len()))
+      .map(|i| a.get(i).unwrap_or(&0).cmp(b.get(i).unwrap_or(&0)))
+      .find(|order| order.is_ne())
+      .unwrap_or(Ordering::Equal)
 }
 
 fn reconcile(manifest_ids: &[[u8; 16]], index_ids: &[String]) -> Result<(), FreeformDecodeError> {
@@ -534,6 +574,39 @@ mod tests {
       assert_eq!(&REAL[archive.index_range.clone()], archive.raw_index);
       assert!(!archive.records.is_empty(), "fixture has structurally owned CRDT records");
       assert_eq!(archive.records.len(), 21, "every fixture CRDT record has a proven owner");
+   }
+
+   #[test]
+   fn real_fixture_needs_a_verified_version() {
+      let archive = parse_native_archive(REAL).expect("fixture envelope");
+      assert_eq!(archive.compatibility, FreeformCompatibility::Supported { version: vec![2, 4] });
+   }
+
+   #[test]
+   fn compatibility_follows_the_newest_declared_version() {
+      let compatibility = |manifest: &[u8]| parse_manifest(manifest).map(|(_, c)| c);
+      let supported =
+         |version: &[u32]| Ok(FreeformCompatibility::Supported { version: version.to_vec() });
+      let unsupported =
+         |version: &[u32]| Ok(FreeformCompatibility::Unsupported { version: version.to_vec() });
+      assert_eq!(compatibility(&[]), Ok(FreeformCompatibility::Unknown));
+      // Object options (field 6) are flags, not a version.
+      assert_eq!(compatibility(&[0x30, 7]), Ok(FreeformCompatibility::Unknown));
+      // Minimum 1, packed.
+      assert_eq!(compatibility(&[0x12, 1, 1]), supported(&[1]));
+      // Minimum 1, good-enough fidelity 2.5: the newer one decides.
+      assert_eq!(compatibility(&[0x12, 1, 1, 0x3a, 2, 2, 5]), unsupported(&[2, 5]));
+      // Minimum 3, unpacked.
+      assert_eq!(compatibility(&[0x10, 3]), unsupported(&[3]));
+      // 2.4.0 is 2.4.
+      assert_eq!(compatibility(&[0x3a, 3, 2, 4, 0]), supported(&[2, 4, 0]));
+      // A fixed32 version and a component past u32 are malformed.
+      for manifest in [&[0x15, 0, 0, 0, 0][..], &[0x12, 5, 0x80, 0x80, 0x80, 0x80, 0x10]] {
+         assert_eq!(
+            compatibility(manifest).unwrap_err().kind,
+            crate::types::FreeformDecodeErrorKind::Invalid
+         );
+      }
    }
 
    #[test]

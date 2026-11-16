@@ -177,10 +177,14 @@ asset refs). **Layout, verified on freehand (5-item), mixed (10-item), and table
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
-│ A. Manifest    [8-byte LE length][protobuf]                          │
-│      protobuf: field1=varint, field3=repeated 20-byte entries        │
-│      each 20-byte entry = { 16-byte item UUID } ref.                 │
-│      The repeat count == number of top-level board items.            │
+│ A. Manifest    [8-byte LE length][protobuf CRLProto.ObjectInfo]      │
+│      1 persistenceType (varint, 99 on the pasteboard)                │
+│      2 minRequiredVersion (repeated uint32: dotted components)       │
+│      3 childObjectReferences: { 1: { 1: 16-byte item UUID } },       │
+│        one per top-level board item                                  │
+│      4 assetReferences   5 dataDirectoryEntries ("objectData", len)  │
+│      6 objectOptions (varint flags, 7)                               │
+│      7 minRequiredVersionForGoodEnoughFidelity (repeated uint32)     │
 ├────────────────────────────────────────────────────────────────────┤
 │ B. Index plist (binary plist, bounded — NOT to EOF)                  │
 │      { id: "<paste UUID>",                                           │
@@ -199,6 +203,12 @@ asset refs). **Layout, verified on freehand (5-item), mixed (10-item), and table
 
 **Parsing notes:**
 
+- Field names and order come from Freeform's own protobuf name map for
+  `CRLProto.ObjectInfo`. Versions are Freeform releases as component lists:
+  Freeform 5.1 copies declare minimum `[1]` and good-enough fidelity `[2, 4]`.
+  `FreeformCompatibility` is `supported` when the newer of the two is at most
+  2.4, the newest version the decoders are verified on, and `unsupported`
+  above it; field 6 (`objectOptions`, `7`) is flags, not a version.
 - Section B does **not** run to EOF. Don't hand the whole blob to a plist
   parser — it reads the wrong 32-byte trailer and dies. Find the bplist trailer
   (5 zero bytes, then `offsetIntSize∈1..8`, `objectRefSize∈1..8`, a sane
